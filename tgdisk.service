@@ -1,0 +1,15 @@
+[Unit]
+Description=TGDrive - Telegram Bot 网盘
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/vol1/1000/openclaw/tgdisk
+ExecStart=/usr/bin/python3 bot.py
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=/vol1/1000/openclaw/tgdisk/.env
+
+[Install]
+WantedBy=multi-user.target

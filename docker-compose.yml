@@ -1,0 +1,16 @@
+version: "3.8"
+
+services:
+  tgdisk:
+    build: .
+    container_name: tgdisk
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "8080:8080"
+
+# 如需代理，在 .env 中设置 PROXY
+# 如需 host 网络访问代理，取消下面注释
+#    network_mode: host
