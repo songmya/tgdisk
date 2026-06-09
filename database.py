@@ -44,6 +44,8 @@ async def init_db():
                 chat_id INTEGER,
                 created_at TEXT DEFAULT (datetime('now', 'localtime')),
                 deleted INTEGER DEFAULT 0,
+                deleted_at TEXT DEFAULT '',
+                deleted_by TEXT DEFAULT '',
                 is_multipart INTEGER DEFAULT 0,
                 chunk_count INTEGER DEFAULT 0,
                 total_sha256 TEXT DEFAULT '',
@@ -93,6 +95,8 @@ async def init_db():
             if col not in cols:
                 await db.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
 
+        await _ensure_column("files", "deleted_at", "deleted_at TEXT DEFAULT ''")
+        await _ensure_column("files", "deleted_by", "deleted_by TEXT DEFAULT ''")
         await _ensure_column("files", "is_multipart", "is_multipart INTEGER DEFAULT 0")
         await _ensure_column("files", "chunk_count", "chunk_count INTEGER DEFAULT 0")
         await _ensure_column("files", "total_sha256", "total_sha256 TEXT DEFAULT ''")
@@ -163,13 +167,51 @@ class FileDB:
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
-    async def delete_file(self, file_id_int: int) -> bool:
-        """软删除文件"""
+    async def delete_file(self, file_id_int: int, deleted_by: str = "webui") -> bool:
+        """软删除文件：进入回收站。"""
         cursor = await self.db.execute(
-            "UPDATE files SET deleted = 1 WHERE id = ? AND deleted = 0", (file_id_int,)
+            """UPDATE files
+               SET deleted = 1, deleted_at = datetime('now', 'localtime'), deleted_by = ?
+               WHERE id = ? AND deleted = 0""",
+            (deleted_by, file_id_int),
         )
         await self.db.commit()
         return cursor.rowcount > 0
+
+    async def restore_file(self, file_id_int: int) -> bool:
+        """从回收站恢复文件。"""
+        cursor = await self.db.execute(
+            """UPDATE files
+               SET deleted = 0, deleted_at = '', deleted_by = ''
+               WHERE id = ? AND deleted = 1""",
+            (file_id_int,),
+        )
+        await self.db.commit()
+        return cursor.rowcount > 0
+
+    async def purge_file(self, file_id_int: int) -> bool:
+        """从数据库中彻底删除索引；Telegram 服务器上的文件无法保证删除。"""
+        cursor = await self.db.execute(
+            "DELETE FROM files WHERE id = ? AND deleted = 1", (file_id_int,)
+        )
+        await self.db.commit()
+        return cursor.rowcount > 0
+
+    async def list_deleted_files(self, limit: int = 50, offset: int = 0) -> list[dict]:
+        """列出回收站文件。"""
+        cursor = await self.db.execute(
+            """SELECT * FROM files WHERE deleted = 1
+               ORDER BY COALESCE(NULLIF(deleted_at,''), created_at) DESC
+               LIMIT ? OFFSET ?""",
+            (limit, offset),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def count_deleted_files(self) -> int:
+        cursor = await self.db.execute("SELECT COUNT(*) FROM files WHERE deleted = 1")
+        row = await cursor.fetchone()
+        return row[0]
 
     async def move_file(self, file_id_int: int, new_path: str) -> bool:
         """移动文件到新路径"""

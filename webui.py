@@ -13,6 +13,7 @@ from starlette.middleware.wsgi import WSGIMiddleware
 import uvicorn
 
 import config
+from database import init_db
 from config import DB_PATH, BOT_TOKEN, PROXY, ADMIN_IDS, MAX_FILE_SIZE
 from tg_io import (upload_local_file_to_tg, upload_stream_to_tg,
                    stream_file_by_id, resume_chunks, cleanup_orphans,
@@ -40,6 +41,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.on_event("startup")
 async def startup_upload_cache():
+    await init_db()
     await init_upload_cache()
 
 WWW = Path(__file__).parent / "www"
@@ -330,12 +332,75 @@ async def api_delete(file_id: int):
     db.row_factory = aiosqlite.Row
     try:
         file_db = FileDB(db)
-        success = await file_db.delete_file(file_id)
+        success = await file_db.delete_file(file_id, deleted_by="webui")
         if not success:
             raise HTTPException(404, "文件不存在或已删除")
         return {"ok": True}
     finally:
         await db.close()
+@app.get("/api/trash")
+async def api_trash(page: int = Query(1), limit: int = Query(50)):
+    """回收站列表。"""
+    from database import FileDB
+    offset = (page - 1) * limit
+    db = await aiosqlite.connect(DB_PATH)
+    db.row_factory = aiosqlite.Row
+    try:
+        file_db = FileDB(db)
+        rows = await file_db.list_deleted_files(limit=limit, offset=offset)
+        total = await file_db.count_deleted_files()
+    finally:
+        await db.close()
+    files = []
+    for r in rows:
+        files.append({
+            "id": r["id"],
+            "file_name": r["file_name"],
+            "file_size": r["file_size"],
+            "size_fmt": format_size(r["file_size"]),
+            "mime_type": r["mime_type"],
+            "file_type": r["file_type"],
+            "path": r["path"],
+            "tags": r["tags"],
+            "created_at": r["created_at"],
+            "deleted_at": r.get("deleted_at", ""),
+            "deleted_by": r.get("deleted_by", ""),
+        })
+    return {"files": files, "total": total, "page": page, "limit": limit, "pages": max(1, -(-total // limit))}
+
+
+@app.post("/api/trash/{file_id}/restore")
+async def api_restore_file(file_id: int):
+    """从回收站恢复文件。"""
+    from database import FileDB
+    db = await aiosqlite.connect(DB_PATH)
+    db.row_factory = aiosqlite.Row
+    try:
+        file_db = FileDB(db)
+        success = await file_db.restore_file(file_id)
+        if not success:
+            raise HTTPException(404, "文件不存在或不在回收站")
+        return {"ok": True}
+    finally:
+        await db.close()
+
+
+@app.delete("/api/trash/{file_id}")
+async def api_purge_file(file_id: int):
+    """从回收站彻底删除索引。"""
+    from database import FileDB
+    db = await aiosqlite.connect(DB_PATH)
+    db.row_factory = aiosqlite.Row
+    try:
+        file_db = FileDB(db)
+        success = await file_db.purge_file(file_id)
+        if not success:
+            raise HTTPException(404, "文件不存在或不在回收站")
+        return {"ok": True}
+    finally:
+        await db.close()
+
+
 @app.get("/api/proxy-download/{file_id}")
 async def proxy_download(file_id: int, request: Request):
     """后端代理下载，支持 Range 请求。单文件 / multipart 自动识别。"""

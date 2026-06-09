@@ -121,6 +121,7 @@ main { max-width: 1200px; margin: 0 auto; padding: 16px; }
   <div class="toolbar">
     <button onclick="toggleUpload()" title="上传文件">📤 上传</button>
     <button class="secondary" onclick="toggleWebDAV()" title="WebDAV 信息">🌐 WebDAV</button>
+    <button class="secondary" onclick="loadTrash()" title="回收站">♻️ 回收站</button>
     <button class="secondary" onclick="newFolder()">📁 新建目录</button>
     <input type="text" id="search-input" placeholder="🔍 搜索文件名或标签..." onkeyup="if(event.key==='Enter')doSearch()">
     <button onclick="doSearch()">搜索</button>
@@ -166,6 +167,7 @@ const API = '';
 let currentPath = '/';
 let currentPage = 1;
 let currentSearch = '';
+let currentView = 'files';
 
 async function loadStats() {
   try {
@@ -177,6 +179,7 @@ async function loadStats() {
 }
 
 async function loadFiles() {
+  currentView = 'files';
   const tbody = document.getElementById('file-tbody');
   tbody.innerHTML = '<tr><td colspan="5" class="empty">加载中...</td></tr>';
   const params = new URLSearchParams({ path: currentPath, page: currentPage, limit: 30 });
@@ -248,10 +251,10 @@ function renderPagination(data) {
   `;
 }
 
-function navigate(path) { currentPath = path; currentPage = 1; currentSearch = ''; document.getElementById('search-input').value = ''; loadFiles(); }
-function doSearch() { currentSearch = document.getElementById('search-input').value.trim(); currentPage = 1; loadFiles(); }
-function goPage(p) { currentPage = p; loadFiles(); }
-function refresh() { loadFiles(); }
+function navigate(path) { currentPath = path; currentPage = 1; currentSearch = ''; currentView = 'files'; document.getElementById('search-input').value = ''; loadFiles(); }
+function doSearch() { currentSearch = document.getElementById('search-input').value.trim(); currentPage = 1; currentView === 'trash' ? loadTrash() : loadFiles(); }
+function goPage(p) { currentPage = p; currentView === 'trash' ? loadTrash() : loadFiles(); }
+function refresh() { currentView === 'trash' ? loadTrash() : loadFiles(); }
 
 async function showDetail(id) {
   try {
@@ -288,7 +291,7 @@ async function downloadFile(id) {
 }
 
 async function deleteFile(id, name) {
-  if (!confirm('确定删除索引？\\n\\n'+name+'\\n\\n注意：文件可能仍存在 Telegram 服务器')) return;
+  if (!confirm('确定删除索引？\\n\\n'+name+'\\n\\n文件会进入回收站，可在回收站恢复。')) return;
   try {
     const r = await fetch(API+'/api/delete/'+id, { method: 'POST' });
     if (!r.ok) {
@@ -296,7 +299,7 @@ async function deleteFile(id, name) {
       toast(err.detail || '删除失败', 'error');
       return;
     }
-    toast('已删除', 'success');
+    toast('已移入回收站', 'success');
     loadFiles();
   } catch(e) { toast('出错: '+e, 'error'); }
 }

@@ -160,6 +160,22 @@ class TelegramFile(DAVNonCollection):
                     bool(self.file_info.get("is_multipart")), lo, hi)
         return _TGStreamReader(self.file_info["id"], range_start=lo, range_end=hi)
 
+    def delete(self):
+        """WebDAV 删除进入回收站，而不是彻底删除索引。"""
+        from database import FileDB
+        async def do_delete():
+            db = await aiosqlite.connect(DB_PATH)
+            db.row_factory = aiosqlite.Row
+            try:
+                fdb = FileDB(db)
+                ok = await fdb.delete_file(self.file_info["id"], deleted_by="webdav")
+                if not ok:
+                    raise RuntimeError("文件不存在或已删除")
+            finally:
+                await db.close()
+        logger.info("WebDAV move to trash: %s (id=%s)", self.file_info["file_name"], self.file_info["id"])
+        run_async(do_delete())
+
 
 class _StreamingWriter:
     """同步 file-like：WebDAV 客户端 write()、close() 会被调用。
@@ -234,6 +250,11 @@ class TelegramFolder(DAVCollection):
         
     def support_recursive_delete(self):
         return False
+
+    def delete(self):
+        # 目录本身没有 deleted 标记；暂不支持 WebDAV 删除目录，避免误删整棵树。
+        from wsgidav.dav_error import DAVError, HTTP_FORBIDDEN
+        raise DAVError(HTTP_FORBIDDEN, "目录删除暂不支持；文件删除会进入回收站")
         
     def begin_write(self, content_type=None):
         """WebDAV上传：先写入本地临时文件，关闭后由系统触发后台TG上传"""
