@@ -5,10 +5,11 @@ import hashlib
 import asyncio
 import aiosqlite
 from pathlib import Path
-from fastapi import FastAPI, Query, HTTPException, UploadFile, File, Request
+from fastapi import FastAPI, Query, HTTPException, UploadFile, File, Request, BackgroundTasks
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.wsgi import WSGIMiddleware
 import uvicorn
 
 import config
@@ -16,9 +17,27 @@ from config import DB_PATH, BOT_TOKEN, PROXY, ADMIN_IDS, MAX_FILE_SIZE
 from tg_io import (upload_local_file_to_tg, upload_stream_to_tg,
                    stream_file_by_id, resume_chunks, cleanup_orphans,
                    SINGLE_UPLOAD_THRESHOLD, CHUNK_SIZE)
+from upload_cache import (
+    UPLOAD_CACHE_ENABLED,
+    init_upload_cache,
+    cache_info,
+    cleanup_upload_cache,
+    create_upload_session,
+    receive_upload_data,
+    process_cached_upload,
+    get_upload_session,
+    list_upload_sessions,
+    cancel_upload_session,
+    delete_upload_session,
+)
 
 app = FastAPI(title="TGDrive Web")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+
+@app.on_event("startup")
+async def startup_upload_cache():
+    await init_upload_cache()
 
 WWW = Path(__file__).parent / "www"
 WWW.mkdir(exist_ok=True)
@@ -39,6 +58,27 @@ async def query_db(sql: str, params: tuple = ()):
     finally:
         await db.close()
 
+
+
+
+# WebDAV 与 WebUI 共用同一个端口：WebDAV 挂载在 /dav
+try:
+    from webdav import create_webdav_app
+    app.mount("/dav", WSGIMiddleware(create_webdav_app()))
+except Exception as e:
+    import logging
+    logging.getLogger(__name__).warning("WebDAV mount disabled: %s", e)
+
+
+
+@app.get("/api/webdav")
+async def api_webdav_info():
+    return {
+        "enabled": True,
+        "path": "/dav",
+        "url": "/dav",
+        "note": "WebDAV is mounted on the same WebUI port under /dav",
+    }
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
@@ -149,31 +189,80 @@ async def api_dirs(path: str = Query("/")):
 
 
 @app.post("/api/upload")
-async def api_upload(file: UploadFile, path: str = "/"):
-    """网页端上传：流式切片，不落盘（峰值内存 ≈ UPLOAD_CONCURRENCY × 18MB）。"""
+async def api_upload(background_tasks: BackgroundTasks, file: UploadFile = File(...), path: str = "/"):
+    """网页端上传：先写入可配置缓存文件，再后台上传 Telegram。
+
+    返回 upload session，前端可轮询 /api/uploads/{session_id} 获取
+    Telegram 分片上传进度。缓存由 UPLOAD_CACHE_* 环境变量控制。
+    """
+    if not UPLOAD_CACHE_ENABLED:
+        # 兼容模式：缓存关闭时回退到旧的流式上传，接口等待 Telegram 完成。
+        filename = file.filename or "upload.bin"
+        mime_type = file.content_type or "application/octet-stream"
+
+        async def reader(n: int) -> bytes:
+            return await file.read(n)
+
+        try:
+            return await upload_stream_to_tg(
+                reader=reader, file_name=filename, mime_type=mime_type,
+                dest_path=path, uploader_id=ADMIN_IDS[0],
+            )
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        except RuntimeError as e:
+            raise HTTPException(502, str(e))
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            raise HTTPException(500, str(e))
+
     filename = file.filename or "upload.bin"
     mime_type = file.content_type or "application/octet-stream"
-
-    async def reader(n: int) -> bytes:
-        # 注意：UploadFile.read(n) 不保证返回刚好 n 字节，常见返回 < n
-        # upload_stream_to_tg 会处理这种。
-        return await file.read(n)
-
+    declared_size = 0
     try:
-        return await upload_stream_to_tg(
-            reader=reader, file_name=filename, mime_type=mime_type,
-            dest_path=path, uploader_id=ADMIN_IDS[0],
-        )
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-    except RuntimeError as e:
-        raise HTTPException(502, str(e))
-    except HTTPException:
-        raise
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(500, str(e))
+        declared_size = int(file.headers.get("content-length") or 0)
+    except Exception:
+        declared_size = 0
+
+    session = await create_upload_session(
+        file_name=filename, file_size=declared_size,
+        mime_type=mime_type, dest_path=path,
+    )
+    session = await receive_upload_data(session["id"], file)
+    background_tasks.add_task(process_cached_upload, session["id"])
+    session["accepted"] = True
+    return session
+
+
+@app.get("/api/upload-cache")
+async def api_upload_cache_info():
+    return await cache_info()
+
+
+@app.post("/api/upload-cache/cleanup")
+async def api_upload_cache_cleanup():
+    return await cleanup_upload_cache()
+
+
+@app.get("/api/uploads")
+async def api_uploads(limit: int = Query(50)):
+    return {"uploads": await list_upload_sessions(limit=limit)}
+
+
+@app.get("/api/uploads/{session_id}")
+async def api_upload_session(session_id: str):
+    return await get_upload_session(session_id)
+
+
+@app.post("/api/uploads/{session_id}/cancel")
+async def api_cancel_upload_session(session_id: str):
+    return await cancel_upload_session(session_id)
+
+
+@app.delete("/api/uploads/{session_id}")
+async def api_delete_upload_session(session_id: str):
+    return await delete_upload_session(session_id)
 
 
 @app.post("/api/mkdir")

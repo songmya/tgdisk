@@ -417,10 +417,13 @@ def patch_folder_for_upload():
 patch_folder_for_upload()
 
 
-def start_webdav():
+def create_webdav_app() -> WsgiDAVApp:
+    """创建 WsgiDAV WSGI 应用。
+
+    可被 webui.py 通过 FastAPI/Starlette 的 WSGIMiddleware 挂载到
+    同一个 HTTP 端口（默认路径 /dav），也可继续由本文件独立启动。
+    """
     config = {
-        "host": "0.0.0.0",
-        "port": 8081,
         "provider_mapping": {
             "/": TGDriveProvider(),
         },
@@ -433,13 +436,19 @@ def start_webdav():
             "enable": True,
         },
     }
-    
-    app = WsgiDAVApp(config)
+    return WsgiDAVApp(config)
+
+
+def start_webdav():
+    """兼容旧部署：单独在 8081 端口启动 WebDAV。"""
+    host = "0.0.0.0"
+    port = 8081
+    app = create_webdav_app()
     server = wsgi.Server(
-        bind_addr=(config["host"], config["port"]),
+        bind_addr=(host, port),
         wsgi_app=app,
     )
-    logger.info(f"WebDAV server running on port {config['port']}")
+    logger.info(f"WebDAV server running on port {port}")
     try:
         server.start()
     except KeyboardInterrupt:

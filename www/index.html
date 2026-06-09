@@ -65,6 +65,40 @@ main { max-width: 1200px; margin: 0 auto; padding: 16px; }
 .toast.success { background:var(--green); }
 .toast.error { background:var(--red); }
 @keyframes slideIn { from { transform:translateX(100%); opacity:0; } to { transform:translateX(0); opacity:1; } }
+
+.upload-panel { background:var(--bg2); border:1px solid var(--bg3); border-radius:var(--radius); margin-bottom:16px; box-shadow:var(--shadow); overflow:hidden; }
+.upload-panel.hidden { display:none; }
+.upload-panel-header { display:flex; justify-content:space-between; align-items:center; padding:10px 14px; background:var(--bg3); gap:10px; }
+.upload-panel-header h2 { font-size:.95rem; color:var(--fg); }
+.upload-panel-header small { color:var(--fg2); }
+.upload-list { display:flex; flex-direction:column; }
+.upload-item { padding:12px 14px; border-top:1px solid var(--bg3); display:grid; grid-template-columns:1fr auto; gap:10px; align-items:center; }
+.upload-item:first-child { border-top:none; }
+.upload-name { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.upload-meta { color:var(--fg2); font-size:.8rem; margin-top:4px; display:flex; gap:10px; flex-wrap:wrap; }
+.progress-label { color:var(--fg2); font-size:.75rem; margin-top:8px; }
+.progress { height:8px; background:var(--bg); border-radius:999px; overflow:hidden; margin-top:4px; }
+.progress-bar { height:100%; width:0%; background:linear-gradient(90deg,var(--accent),var(--green)); transition:width .15s ease; }
+.upload-actions { display:flex; gap:6px; }
+.upload-actions button { padding:5px 10px; border-radius:4px; border:1px solid var(--bg3); background:var(--bg2); color:var(--fg); cursor:pointer; font-size:.8rem; }
+.upload-actions button:hover { border-color:var(--accent); color:var(--accent); }
+.upload-actions button.danger:hover { border-color:var(--red); color:var(--red); }
+.upload-status-success .progress-bar { background:var(--green); }
+.upload-status-error .progress-bar, .upload-status-canceled .progress-bar { background:var(--red); }
+.webdav-card { background:var(--bg2); border:1px solid var(--bg3); border-radius:var(--radius); padding:12px 14px; margin-bottom:16px; display:flex; justify-content:space-between; gap:12px; align-items:center; box-shadow:var(--shadow); }
+.webdav-card.hidden { display:none; }
+.webdav-card .title { font-weight:700; color:var(--accent); margin-bottom:4px; }
+.webdav-card .desc { color:var(--fg2); font-size:.85rem; }
+.webdav-card code { color:var(--fg); background:var(--bg); padding:2px 6px; border-radius:4px; }
+.webdav-card .actions { display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end; }
+.webdav-card button { padding:7px 12px; border-radius:var(--radius); border:1px solid var(--bg3); background:var(--bg2); color:var(--fg); cursor:pointer; }
+.webdav-card button.primary { background:var(--accent); border-color:var(--accent); }
+@media (max-width: 768px) {
+  .upload-item { grid-template-columns:1fr; }
+  .webdav-card { flex-direction:column; align-items:flex-start; }
+  .webdav-card .actions { justify-content:flex-start; }
+}
+
 @media (max-width: 768px) {
   header { padding:10px 14px; }
   header h1 { font-size:1rem; }
@@ -86,6 +120,7 @@ main { max-width: 1200px; margin: 0 auto; padding: 16px; }
 <main>
   <div class="toolbar">
     <button onclick="toggleUpload()" title="上传文件">📤 上传</button>
+    <button class="secondary" onclick="toggleWebDAV()" title="WebDAV 信息">🌐 WebDAV</button>
     <button class="secondary" onclick="newFolder()">📁 新建目录</button>
     <input type="text" id="search-input" placeholder="🔍 搜索文件名或标签..." onkeyup="if(event.key==='Enter')doSearch()">
     <button onclick="doSearch()">搜索</button>
@@ -95,6 +130,25 @@ main { max-width: 1200px; margin: 0 auto; padding: 16px; }
     📂 拖拽文件到此处或点击上传<br><small style="color:var(--fg2)">可指定路径：在上方 toolbar 额外输入 /path 即可</small>
   </div>
   <input type="file" id="file-input" multiple hidden onchange="uploadFiles(this.files)">
+  <section id="upload-panel" class="upload-panel hidden">
+    <div class="upload-panel-header">
+      <div><h2>上传队列</h2><small>支持大文件缓存与后台分片上传；先显示上传到服务器进度，再显示上传到 Telegram 进度。</small></div>
+      <button class="secondary" onclick="clearFinishedUploads()">清除已完成</button>
+    </div>
+    <div id="upload-list" class="upload-list"></div>
+  </section>
+  <section id="webdav-card" class="webdav-card hidden">
+    <div>
+      <div class="title">🌐 WebDAV</div>
+      <div class="desc">与 WebUI 共用当前端口，挂载路径：<code id="webdav-url">/dav/</code></div>
+      <div class="desc">在支持 WebDAV 的客户端中填入这个地址即可访问当前 TGDrive 文件树。</div>
+    </div>
+    <div class="actions">
+      <button class="primary" onclick="openWebDAV()">打开</button>
+      <button onclick="copyWebDAVUrl()">复制地址</button>
+      <button onclick="refreshWebDAVInfo()">刷新状态</button>
+    </div>
+  </section>
   <div id="breadcrumb" class="breadcrumb"></div>
   <div class="file-list">
     <table>
@@ -267,34 +321,297 @@ async function newFolder() {
     loadFiles();
   } catch(e) { toast('出错: '+e, 'error'); }
 }
-async function uploadFiles(files) {
+const uploads = new Map();
+let uploadSeq = 0;
+let activeUploads = 0;
+const MAX_PARALLEL_UPLOADS = 2;
+
+function uploadFiles(files) {
   if (!files || !files.length) return;
-  
-  for (let i = 0; i < files.length; i++) {
-    const file = files[i];
-    toast(`正在上传 ${file.name}...`, 'success');
-    const formData = new FormData();
-    formData.append('file', file);
-    
-    try {
-      const r = await fetch(API+'/api/upload?path='+encodeURIComponent(currentPath), {
-        method: 'POST',
-        body: formData
-      });
-      if (!r.ok) {
-        const err = await r.json();
-        toast(`上传 ${file.name} 失败: ${err.detail}`, 'error');
-      } else {
-        toast(`${file.name} 上传成功!`, 'success');
-      }
-    } catch(e) {
-      toast(`上传 ${file.name} 出错: ${e}`, 'error');
-    }
-  }
-  
-  loadFiles();
-  document.getElementById('upload-zone').classList.add('hidden');
+  document.getElementById('upload-panel').classList.remove('hidden');
+  Array.from(files).forEach(file => {
+    const id = ++uploadSeq;
+    uploads.set(id, {
+      id, file, path: currentPath, status: 'queued', progress: 0,
+      loaded: 0, total: file.size, speed: 0, startedAt: 0,
+      xhr: null, pollTimer: null, sessionId: '', result: null, error: '', abortReason: 'canceled', telegramProgress: 0, telegramRead: 0, telegramTotal: 0
+    });
+  });
+  renderUploads();
+  startUploadQueue();
+  document.getElementById('file-input').value = '';
 }
+
+function startUploadQueue() {
+  while (activeUploads < MAX_PARALLEL_UPLOADS) {
+    const task = Array.from(uploads.values()).find(t => t.status === 'queued');
+    if (!task) break;
+    startUpload(task);
+  }
+}
+
+function startUpload(task) {
+  task.status = 'uploading';
+  task.startedAt = Date.now();
+  task.loaded = 0;
+  task.progress = 0;
+  activeUploads++;
+  renderUploads();
+
+  const formData = new FormData();
+  formData.append('file', task.file);
+  const xhr = new XMLHttpRequest();
+  task.xhr = xhr;
+
+  xhr.upload.onprogress = (e) => {
+    if (!e.lengthComputable) return;
+    const now = Date.now();
+    task.loaded = e.loaded;
+    task.total = e.total || task.file.size;
+    task.progress = Math.max(0, Math.min(100, (e.loaded / task.total) * 100));
+    const elapsed = Math.max(1, (now - task.startedAt) / 1000);
+    task.speed = e.loaded / elapsed;
+    renderUploads();
+  };
+
+  xhr.onload = () => {
+    activeUploads = Math.max(0, activeUploads - 1);
+    task.xhr = null;
+    if (xhr.status >= 200 && xhr.status < 300) {
+      try { task.result = JSON.parse(xhr.responseText || '{}'); } catch (_) { task.result = {}; }
+      task.progress = 100;
+      task.loaded = task.total;
+      task.sessionId = task.result.id || task.result.session_id || '';
+      if (task.result.accepted && task.sessionId) {
+        task.status = 'telegram';
+        task.telegramProgress = task.result.telegram_progress || 0;
+        toast(`${task.file.name} 已缓存，开始后台上传 Telegram`, 'success');
+        pollUploadSession(task);
+      } else {
+        task.status = 'success';
+        task.telegramProgress = 100;
+        toast(`${task.file.name} 上传成功`, 'success');
+        loadFiles();
+      }
+    } else {
+      task.status = 'error';
+      try {
+        const err = JSON.parse(xhr.responseText || '{}');
+        task.error = err.detail || xhr.statusText || `HTTP ${xhr.status}`;
+      } catch (_) { task.error = xhr.statusText || `HTTP ${xhr.status}`; }
+      toast(`上传 ${task.file.name} 失败: ${task.error}`, 'error');
+    }
+    renderUploads();
+    startUploadQueue();
+  };
+
+  xhr.onerror = () => {
+    activeUploads = Math.max(0, activeUploads - 1);
+    task.xhr = null;
+    task.status = 'error';
+    task.error = '网络错误或连接中断';
+    toast(`上传 ${task.file.name} 出错`, 'error');
+    renderUploads();
+    startUploadQueue();
+  };
+
+  xhr.onabort = () => {
+    activeUploads = Math.max(0, activeUploads - 1);
+    task.xhr = null;
+    task.status = task.abortReason === 'paused' ? 'paused' : 'canceled';
+    task.error = task.status === 'paused' ? '已暂停：当前版本会中止请求，重新开始时需从头上传' : '已取消';
+    renderUploads();
+    startUploadQueue();
+  };
+
+  xhr.open('POST', API+'/api/upload?path='+encodeURIComponent(task.path));
+  xhr.send(formData);
+}
+
+function pauseUpload(id) {
+  const task = uploads.get(id);
+  if (!task) return;
+  if (task.status === 'telegram') {
+    toast('后台 Telegram 上传暂不支持真正暂停；可取消任务或等待完成', 'error');
+    return;
+  }
+  if (task.status === 'queued') {
+    task.status = 'paused';
+    task.error = '已暂停，点击重新开始会从头上传';
+    renderUploads();
+    return;
+  }
+  if (task.xhr) {
+    task.abortReason = 'paused';
+    task.xhr.abort();
+  }
+}
+
+function resumeUpload(id) {
+  const task = uploads.get(id);
+  if (!task || !['paused','canceled','error'].includes(task.status)) return;
+  task.status = 'queued';
+  task.progress = 0;
+  task.loaded = 0;
+  task.speed = 0;
+  task.error = '';
+  task.abortReason = 'canceled';
+  renderUploads();
+  startUploadQueue();
+}
+
+async function cancelUpload(id) {
+  const task = uploads.get(id);
+  if (!task) return;
+  if (task.pollTimer) {
+    clearTimeout(task.pollTimer);
+    task.pollTimer = null;
+  }
+  if (task.sessionId && task.status === 'telegram') {
+    try { await fetch(API+'/api/uploads/'+task.sessionId+'/cancel', { method: 'POST' }); } catch (_) {}
+    task.status = 'canceled';
+    task.error = '已取消后台任务（已开始的 Telegram 分片可能仍会完成当前片）';
+    renderUploads();
+    return;
+  }
+  if (task.status === 'queued' || task.status === 'paused') {
+    task.status = 'canceled';
+    task.error = '已取消';
+    renderUploads();
+    return;
+  }
+  if (task.xhr) {
+    task.abortReason = 'canceled';
+    task.xhr.abort();
+  }
+}
+
+function removeUpload(id) {
+  const task = uploads.get(id);
+  if (!task) return;
+  if (task.xhr) cancelUpload(id);
+  uploads.delete(id);
+  renderUploads();
+}
+
+function clearFinishedUploads() {
+  for (const [id, task] of uploads) {
+    if (['success','error','canceled','paused'].includes(task.status) && !task.xhr) uploads.delete(id);
+  }
+  renderUploads();
+}
+
+function renderUploads() {
+  const panel = document.getElementById('upload-panel');
+  const list = document.getElementById('upload-list');
+  if (!uploads.size) {
+    list.innerHTML = '<div class="empty">暂无上传任务</div>';
+    return;
+  }
+  panel.classList.remove('hidden');
+  list.innerHTML = Array.from(uploads.values()).map(task => {
+    const pct = task.progress || 0;
+    const statusText = uploadStatusText(task);
+    const resultText = task.result ? ` · ${task.result.mode || ''}${task.result.chunk_count ? ` · ${task.result.chunk_count} 片` : ''}${task.result.file_id ? ` · 文件ID ${task.result.file_id}` : ''}${task.sessionId ? ` · 任务 ${task.sessionId.slice(0,8)}` : ''}` : '';
+    const canPause = task.status === 'uploading' || task.status === 'queued' || task.status === 'telegram';
+    const canResume = ['paused','canceled','error'].includes(task.status) && !task.sessionId;
+    const canCancel = ['uploading','queued','paused','telegram'].includes(task.status);
+    return `<div class="upload-item upload-status-${task.status}">
+      <div>
+        <div class="upload-name">${esc(task.file.name)}</div>
+        <div class="upload-meta">
+          <span>${formatSize(task.file.size)}</span>
+          <span>${statusText}${resultText}</span>
+          <span>${pct.toFixed(1)}%</span>
+          ${task.speed && task.status === 'uploading' ? `<span>${formatSize(task.speed)}/s</span>` : ''}
+          ${task.error ? `<span style="color:var(--red)">${esc(task.error)}</span>` : ''}
+        </div>
+        <div class="progress-label">上传到服务器</div>
+        <div class="progress"><div class="progress-bar" style="width:${pct}%"></div></div>
+        ${task.sessionId ? `<div class="progress-label">上传到 Telegram ${task.telegramProgress ? task.telegramProgress.toFixed(1) : '0.0'}%</div><div class="progress"><div class="progress-bar" style="width:${task.telegramProgress || 0}%"></div></div>` : ''}
+      </div>
+      <div class="upload-actions">
+        ${canPause ? `<button onclick="pauseUpload(${task.id})">暂停</button>` : ''}
+        ${canResume ? `<button onclick="resumeUpload(${task.id})">重新开始</button>` : ''}
+        ${canCancel ? `<button class="danger" onclick="cancelUpload(${task.id})">取消</button>` : ''}
+        ${!task.xhr ? `<button onclick="removeUpload(${task.id})">移除</button>` : ''}
+      </div>
+    </div>`;
+  }).join('');
+}
+
+async function pollUploadSession(task) {
+  if (!task.sessionId) return;
+  if (task.pollTimer) clearTimeout(task.pollTimer);
+  try {
+    const r = await fetch(API+'/api/uploads/'+task.sessionId);
+    if (!r.ok) throw new Error('状态接口返回 '+r.status);
+    const d = await r.json();
+    task.result = d.result || task.result || d;
+    task.telegramProgress = d.telegram_progress || 0;
+    task.telegramRead = d.telegram_read_bytes || 0;
+    task.telegramTotal = d.telegram_total_bytes || d.total_size || 0;
+    if (d.status === 'done') {
+      task.status = 'success';
+      task.telegramProgress = 100;
+      task.result = d.result || task.result;
+      toast(`${task.file.name} Telegram 上传完成`, 'success');
+      loadFiles();
+      renderUploads();
+      return;
+    }
+    if (d.status === 'failed' || d.status === 'canceled') {
+      task.status = d.status === 'failed' ? 'error' : 'canceled';
+      task.error = d.error || task.status;
+      renderUploads();
+      return;
+    }
+    task.status = 'telegram';
+    renderUploads();
+    task.pollTimer = setTimeout(() => pollUploadSession(task), 1500);
+  } catch(e) {
+    task.error = '状态刷新失败: '+e.message;
+    renderUploads();
+    task.pollTimer = setTimeout(() => pollUploadSession(task), 3000);
+  }
+}
+
+function uploadStatusText(task) {
+  return {
+    queued: '等待中', uploading: '上传到服务器', telegram: '上传到 Telegram', success: '已完成',
+    error: '失败', canceled: '已取消', paused: '已暂停'
+  }[task.status] || task.status;
+}
+
+function webdavAbsoluteUrl() {
+  return window.location.origin + '/dav/';
+}
+function toggleWebDAV() {
+  const card = document.getElementById('webdav-card');
+  card.classList.toggle('hidden');
+  refreshWebDAVInfo();
+}
+async function refreshWebDAVInfo() {
+  const el = document.getElementById('webdav-url');
+  if (el) el.textContent = webdavAbsoluteUrl();
+  try {
+    const r = await fetch(API+'/api/webdav');
+    if (!r.ok) throw new Error('WebDAV 状态接口不可用');
+  } catch(e) {
+    toast('WebDAV 状态检查失败: '+e.message, 'error');
+  }
+}
+function openWebDAV() { window.open(webdavAbsoluteUrl(), '_blank'); }
+async function copyWebDAVUrl() {
+  const url = webdavAbsoluteUrl();
+  try {
+    await navigator.clipboard.writeText(url);
+    toast('WebDAV 地址已复制', 'success');
+  } catch(e) {
+    prompt('复制 WebDAV 地址：', url);
+  }
+}
+
 
 function fileIcon(mime, name) {
   if (mime) {

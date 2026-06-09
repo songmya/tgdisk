@@ -118,3 +118,23 @@ docker compose up -d
 - file_id 在不同 bot 间不通用，不要换 bot token
 - 不建议存储特别敏感的文件（证件、密钥等）
 - 建议定期备份 `data/tgdrive.sqlite3`
+
+## WebUI 上传缓存
+
+WebUI 默认启用“先缓存、后后台上传 Telegram”的模式：浏览器先把文件上传到服务器缓存目录，后端随后从缓存文件分片上传到 Telegram。这样页面可以展示两个阶段的进度：
+
+1. 上传到服务器缓存
+2. 上传到 Telegram 分片
+
+相关环境变量：
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `UPLOAD_CACHE_ENABLED` | `true` | 是否启用 WebUI 上传缓存；关闭后回退旧的流式上传模式 |
+| `UPLOAD_CACHE_DIR` | `data/cache` | 缓存文件目录 |
+| `UPLOAD_CACHE_MAX_SIZE_MB` | `10240` | 缓存总容量上限，单位 MB |
+| `UPLOAD_CACHE_MAX_FILE_SIZE_MB` | `0` | 单个缓存文件上限，0 表示不限 |
+| `UPLOAD_CACHE_TTL_HOURS` | `24` | 失败/取消/未完成任务的缓存保留时间 |
+| `UPLOAD_CACHE_KEEP_AFTER_DONE` | `false` | 上传成功后是否保留缓存文件；默认成功后自动删除 |
+
+注意：缓存会让原始文件短暂落盘。请确保 `UPLOAD_CACHE_DIR` 不对外暴露，并按磁盘容量设置合理的 `UPLOAD_CACHE_MAX_SIZE_MB`。

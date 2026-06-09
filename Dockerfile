@@ -11,8 +11,8 @@ RUN apt-get update && apt-get install -y supervisor && rm -rf /var/lib/apt/lists
 
 COPY . .
 
-# 暴露 WebUI 和 WebDAV 端口
-EXPOSE 8080 8081
+# 暴露 WebUI 端口；WebDAV 挂载在同端口 /dav
+EXPOSE 8080
 
 # 创建数据目录
 RUN mkdir -p data

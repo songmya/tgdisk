@@ -3,14 +3,53 @@ version: "3.8"
 services:
   tgdisk:
     build: .
+    image: tgdisk:latest
     container_name: tgdisk
     restart: unless-stopped
     env_file: .env
+
+    # 数据持久化：sqlite 数据库 + 任何 sqlite-wal/shm 文件
     volumes:
       - ./data:/app/data
+
     ports:
+      # WebUI（FastAPI）+ WebDAV（/dav）共用同一个端口
       - "8080:8080"
 
-# 如需代理，在 .env 中设置 PROXY
-# 如需 host 网络访问代理，取消下面注释
-#    network_mode: host
+    # 默认走桥接 + .env 里的 HTTP 代理。
+    # 如果代理在 host 上(127.0.0.1:7890 这类)、且不想暴露到 LAN，
+    # 取消下面 network_mode: host，并把 ports 注释掉。
+    # network_mode: host
+
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/api/stats || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# ===== 可选：自建 Bot API Server（去掉 50MB / 20MB 限制，单文件最高 2GB）=====
+# 自建后，在 .env 里设置：
+#   LOCAL_API_BASE=http://botapi:8081
+#   LOCAL_API_MODE=true        # 同机部署时启用，下载走本地路径
+# 然后取消下面 botapi 服务的注释。
+# 注意：自建 Bot API Server **不支持出网代理**，所以要么宿主机能直连 Telegram，
+# 要么用 socat / sing-box 之类的工具帮它把出网流量代理掉。
+#
+#  botapi:
+#    image: aiogram/telegram-bot-api:latest
+#    container_name: tgdisk-botapi
+#    restart: unless-stopped
+#    environment:
+#      TELEGRAM_API_ID: "YOUR_API_ID"        # https://my.telegram.org/apps
+#      TELEGRAM_API_HASH: "YOUR_API_HASH"
+#      TELEGRAM_LOCAL: "1"
+#    volumes:
+#      - ./data/botapi:/var/lib/telegram-bot-api
+#    # 不暴露端口，仅 tgdisk 通过容器网络访问
