@@ -272,11 +272,6 @@ async function uploadFiles(files) {
   
   for (let i = 0; i < files.length; i++) {
     const file = files[i];
-    if (file.size > 50 * 1024 * 1024) {
-      toast(`${file.name} 超过50MB，需使用 Telegram 客户端发给 Bot 上传`, 'error');
-      continue;
-    }
-    
     toast(`正在上传 ${file.name}...`, 'success');
     const formData = new FormData();
     formData.append('file', file);
