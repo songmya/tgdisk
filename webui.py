@@ -24,6 +24,9 @@ from upload_cache import (
     cleanup_upload_cache,
     create_upload_session,
     receive_upload_data,
+    write_upload_chunk,
+    mark_upload_paused,
+    commit_cached_upload,
     process_cached_upload,
     get_upload_session,
     list_upload_sessions,
@@ -231,6 +234,42 @@ async def api_upload(background_tasks: BackgroundTasks, file: UploadFile = File(
     )
     session = await receive_upload_data(session["id"], file)
     background_tasks.add_task(process_cached_upload, session["id"])
+    session["accepted"] = True
+    return session
+
+
+@app.post("/api/uploads/init")
+async def api_upload_init(
+    file_name: str = Query(...),
+    file_size: int = Query(...),
+    mime_type: str = Query("application/octet-stream"),
+    path: str = Query("/"),
+):
+    """初始化浏览器分块上传任务。"""
+    session = await create_upload_session(
+        file_name=file_name, file_size=file_size, mime_type=mime_type,
+        dest_path=path, upload_mode="chunked", chunk_size=0,
+    )
+    session["chunk_size"] = session.get("chunk_size") or 0
+    return session
+
+
+@app.post("/api/uploads/{session_id}/chunk")
+async def api_upload_chunk(session_id: str, request: Request, offset: int = Query(...)):
+    """写入一个浏览器分片。客户端必须按 offset 顺序上传。"""
+    data = await request.body()
+    return await write_upload_chunk(session_id, offset, data)
+
+
+@app.post("/api/uploads/{session_id}/pause")
+async def api_pause_upload_session(session_id: str):
+    return await mark_upload_paused(session_id)
+
+
+@app.post("/api/uploads/{session_id}/commit")
+async def api_commit_upload_session(session_id: str, background_tasks: BackgroundTasks):
+    session = await commit_cached_upload(session_id)
+    background_tasks.add_task(process_cached_upload, session_id)
     session["accepted"] = True
     return session
 

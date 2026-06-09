@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 import aiosqlite
-from fastapi import HTTPException, UploadFile
+from fastapi import HTTPException, UploadFile, Request
 
 from config import DB_PATH, ADMIN_IDS
 from tg_io import upload_local_file_to_tg, CHUNK_SIZE
@@ -24,6 +24,7 @@ UPLOAD_CACHE_TTL_HOURS = int(os.getenv("UPLOAD_CACHE_TTL_HOURS", "24"))
 UPLOAD_CACHE_KEEP_AFTER_DONE = os.getenv("UPLOAD_CACHE_KEEP_AFTER_DONE", "false").lower() in ("1", "true", "yes", "on")
 
 WRITE_CHUNK_SIZE = 1024 * 1024
+BROWSER_CHUNK_SIZE = int(os.getenv("BROWSER_CHUNK_SIZE", "8388608"))  # 8MiB
 
 
 def _now() -> int:
@@ -42,6 +43,13 @@ async def _db() -> aiosqlite.Connection:
     return db
 
 
+async def _ensure_column(db: aiosqlite.Connection, table: str, col: str, ddl: str) -> None:
+    cursor = await db.execute(f"PRAGMA table_info({table})")
+    cols = [row[1] for row in await cursor.fetchall()]
+    if col not in cols:
+        await db.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+
+
 async def init_upload_cache() -> None:
     UPLOAD_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     db = await _db()
@@ -55,6 +63,8 @@ async def init_upload_cache() -> None:
                 dest_path TEXT DEFAULT '/',
                 total_size INTEGER DEFAULT 0,
                 received_size INTEGER DEFAULT 0,
+                upload_mode TEXT DEFAULT 'form',
+                chunk_size INTEGER DEFAULT 0,
                 cache_path TEXT NOT NULL,
                 status TEXT DEFAULT 'created',
                 stage TEXT DEFAULT 'created',
@@ -72,6 +82,8 @@ async def init_upload_cache() -> None:
             CREATE INDEX IF NOT EXISTS idx_upload_sessions_expires ON upload_sessions(expires_at);
             """
         )
+        await _ensure_column(db, "upload_sessions", "upload_mode", "upload_mode TEXT DEFAULT 'form'")
+        await _ensure_column(db, "upload_sessions", "chunk_size", "chunk_size INTEGER DEFAULT 0")
         await db.commit()
     finally:
         await db.close()
@@ -149,6 +161,8 @@ async def init_table_only() -> None:
                 dest_path TEXT DEFAULT '/',
                 total_size INTEGER DEFAULT 0,
                 received_size INTEGER DEFAULT 0,
+                upload_mode TEXT DEFAULT 'form',
+                chunk_size INTEGER DEFAULT 0,
                 cache_path TEXT NOT NULL,
                 status TEXT DEFAULT 'created',
                 stage TEXT DEFAULT 'created',
@@ -163,6 +177,8 @@ async def init_table_only() -> None:
                 expires_at INTEGER NOT NULL
             )"""
         )
+        await _ensure_column(db, "upload_sessions", "upload_mode", "upload_mode TEXT DEFAULT 'form'")
+        await _ensure_column(db, "upload_sessions", "chunk_size", "chunk_size INTEGER DEFAULT 0")
         await db.commit()
     finally:
         await db.close()
@@ -196,12 +212,13 @@ async def cache_info() -> dict:
         "max_file_size_mb": UPLOAD_CACHE_MAX_FILE_SIZE_MB,
         "ttl_hours": UPLOAD_CACHE_TTL_HOURS,
         "keep_after_done": UPLOAD_CACHE_KEEP_AFTER_DONE,
+        "browser_chunk_size": BROWSER_CHUNK_SIZE,
         "size_bytes": await cache_size_bytes(),
         "by_status": by_status,
     }
 
 
-async def create_upload_session(file_name: str, file_size: int = 0, mime_type: str = "application/octet-stream", dest_path: str = "/") -> dict:
+async def create_upload_session(file_name: str, file_size: int = 0, mime_type: str = "application/octet-stream", dest_path: str = "/", upload_mode: str = "form", chunk_size: int = 0) -> dict:
     if not UPLOAD_CACHE_ENABLED:
         raise HTTPException(400, "上传缓存未启用")
     await init_upload_cache()
@@ -224,11 +241,11 @@ async def create_upload_session(file_name: str, file_size: int = 0, mime_type: s
     try:
         await db.execute(
             """INSERT INTO upload_sessions
-               (id, file_name, mime_type, dest_path, total_size, cache_path, status, stage,
+               (id, file_name, mime_type, dest_path, total_size, upload_mode, chunk_size, cache_path, status, stage,
                 telegram_total_bytes, telegram_total_chunks, created_at, updated_at, expires_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'created', 'created', ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'created', 'created', ?, ?, ?, ?, ?)""",
             (sid, safe_name, mime_type or "application/octet-stream", dest_path or "/", file_size,
-             str(cache_path), file_size, total_chunks, ts, ts, _expires_at()),
+             upload_mode, chunk_size or 0, str(cache_path), file_size, total_chunks, ts, ts, _expires_at()),
         )
         await db.commit()
     finally:
@@ -268,6 +285,62 @@ async def list_upload_sessions(limit: int = 50) -> list[dict]:
     finally:
         await db.close()
     return [await get_upload_session(i) for i in ids]
+
+
+async def write_upload_chunk(session_id: str, offset: int, data: bytes) -> dict:
+    """Write a browser-uploaded chunk into the cache file at an exact offset."""
+    if offset < 0:
+        raise HTTPException(400, "offset 不能为负数")
+    if not data:
+        raise HTTPException(400, "chunk 为空")
+    s = await get_upload_session(session_id)
+    if s["status"] not in ("created", "receiving", "paused", "failed"):
+        raise HTTPException(409, f"当前状态不允许写入分片: {s['status']}")
+    total_size = int(s.get("total_size") or 0)
+    end = offset + len(data)
+    if total_size and end > total_size:
+        raise HTTPException(416, "分片超出文件总大小")
+    if UPLOAD_CACHE_MAX_FILE_SIZE_MB > 0 and end > UPLOAD_CACHE_MAX_FILE_SIZE_MB * 1024 * 1024:
+        raise HTTPException(413, f"文件超过 UPLOAD_CACHE_MAX_FILE_SIZE_MB={UPLOAD_CACHE_MAX_FILE_SIZE_MB}MB")
+
+    path = Path(s["cache_path"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # We upload sequentially from the browser, so strict offset prevents holes and
+    # makes resume robust without maintaining a chunk bitmap.
+    current = path.stat().st_size if path.exists() else 0
+    if offset != current:
+        raise HTTPException(409, {"message": "offset 不匹配", "expected_offset": current, "received_offset": offset})
+    with path.open("ab") as out:
+        out.write(data)
+    status = "cached" if total_size and end >= total_size else "receiving"
+    stage = "cached" if status == "cached" else "receiving"
+    total_chunks = (total_size + CHUNK_SIZE - 1) // CHUNK_SIZE if total_size else 0
+    await _update(session_id, received_size=end, status=status, stage=stage,
+                  telegram_total_bytes=total_size, telegram_total_chunks=total_chunks,
+                  updated_at=_now(), expires_at=_expires_at())
+    return await get_upload_session(session_id)
+
+
+async def mark_upload_paused(session_id: str) -> dict:
+    s = await get_upload_session(session_id)
+    if s["status"] in ("created", "receiving"):
+        await _update(session_id, status="paused", stage="paused", updated_at=_now(), expires_at=_expires_at())
+    return await get_upload_session(session_id)
+
+
+async def commit_cached_upload(session_id: str) -> dict:
+    s = await get_upload_session(session_id)
+    if s["status"] == "done":
+        return s
+    if s["status"] not in ("cached", "paused"):
+        raise HTTPException(409, f"当前状态不允许提交: {s['status']}")
+    path = Path(s["cache_path"])
+    actual = path.stat().st_size if path.exists() else 0
+    if int(s.get("total_size") or 0) and actual < int(s["total_size"]):
+        raise HTTPException(409, {"message": "缓存文件尚未接收完整", "received_size": actual, "total_size": s["total_size"]})
+    await _update(session_id, status="cached", stage="cached", received_size=actual,
+                  telegram_total_bytes=actual, updated_at=_now(), expires_at=_expires_at())
+    return await get_upload_session(session_id)
 
 
 async def receive_upload_data(session_id: str, file: UploadFile) -> dict:

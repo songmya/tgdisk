@@ -325,6 +325,7 @@ const uploads = new Map();
 let uploadSeq = 0;
 let activeUploads = 0;
 const MAX_PARALLEL_UPLOADS = 2;
+const BROWSER_CHUNK_SIZE = 8 * 1024 * 1024;
 
 function uploadFiles(files) {
   if (!files || !files.length) return;
@@ -334,7 +335,9 @@ function uploadFiles(files) {
     uploads.set(id, {
       id, file, path: currentPath, status: 'queued', progress: 0,
       loaded: 0, total: file.size, speed: 0, startedAt: 0,
-      xhr: null, pollTimer: null, sessionId: '', result: null, error: '', abortReason: 'canceled', telegramProgress: 0, telegramRead: 0, telegramTotal: 0
+      sessionId: '', result: null, error: '', abortReason: 'canceled',
+      telegramProgress: 0, telegramRead: 0, telegramTotal: 0,
+      pollTimer: null, paused: false, canceled: false, currentController: null
     });
   });
   renderUploads();
@@ -350,112 +353,125 @@ function startUploadQueue() {
   }
 }
 
-function startUpload(task) {
+async function startUpload(task) {
   task.status = 'uploading';
+  task.paused = false;
+  task.canceled = false;
+  task.error = '';
   task.startedAt = Date.now();
-  task.loaded = 0;
-  task.progress = 0;
+  task.speed = 0;
   activeUploads++;
   renderUploads();
-
-  const formData = new FormData();
-  formData.append('file', task.file);
-  const xhr = new XMLHttpRequest();
-  task.xhr = xhr;
-
-  xhr.upload.onprogress = (e) => {
-    if (!e.lengthComputable) return;
-    const now = Date.now();
-    task.loaded = e.loaded;
-    task.total = e.total || task.file.size;
-    task.progress = Math.max(0, Math.min(100, (e.loaded / task.total) * 100));
-    const elapsed = Math.max(1, (now - task.startedAt) / 1000);
-    task.speed = e.loaded / elapsed;
-    renderUploads();
-  };
-
-  xhr.onload = () => {
-    activeUploads = Math.max(0, activeUploads - 1);
-    task.xhr = null;
-    if (xhr.status >= 200 && xhr.status < 300) {
-      try { task.result = JSON.parse(xhr.responseText || '{}'); } catch (_) { task.result = {}; }
-      task.progress = 100;
-      task.loaded = task.total;
-      task.sessionId = task.result.id || task.result.session_id || '';
-      if (task.result.accepted && task.sessionId) {
-        task.status = 'telegram';
-        task.telegramProgress = task.result.telegram_progress || 0;
-        toast(`${task.file.name} 已缓存，开始后台上传 Telegram`, 'success');
-        pollUploadSession(task);
-      } else {
-        task.status = 'success';
-        task.telegramProgress = 100;
-        toast(`${task.file.name} 上传成功`, 'success');
-        loadFiles();
-      }
-    } else {
-      task.status = 'error';
-      try {
-        const err = JSON.parse(xhr.responseText || '{}');
-        task.error = err.detail || xhr.statusText || `HTTP ${xhr.status}`;
-      } catch (_) { task.error = xhr.statusText || `HTTP ${xhr.status}`; }
-      toast(`上传 ${task.file.name} 失败: ${task.error}`, 'error');
-    }
-    renderUploads();
-    startUploadQueue();
-  };
-
-  xhr.onerror = () => {
-    activeUploads = Math.max(0, activeUploads - 1);
-    task.xhr = null;
+  try {
+    if (!task.sessionId) await initChunkedUpload(task);
+    await uploadChunks(task);
+    if (task.paused || task.canceled) return;
+    await commitUpload(task);
+  } catch (e) {
+    if (task.paused || task.canceled) return;
     task.status = 'error';
-    task.error = '网络错误或连接中断';
-    toast(`上传 ${task.file.name} 出错`, 'error');
-    renderUploads();
-    startUploadQueue();
-  };
-
-  xhr.onabort = () => {
+    task.error = e.message || String(e);
+    toast(`上传 ${task.file.name} 失败: ${task.error}`, 'error');
+  } finally {
     activeUploads = Math.max(0, activeUploads - 1);
-    task.xhr = null;
-    task.status = task.abortReason === 'paused' ? 'paused' : 'canceled';
-    task.error = task.status === 'paused' ? '已暂停：当前版本会中止请求，重新开始时需从头上传' : '已取消';
+    task.currentController = null;
     renderUploads();
     startUploadQueue();
-  };
+  }
+}
 
-  xhr.open('POST', API+'/api/upload?path='+encodeURIComponent(task.path));
-  xhr.send(formData);
+async function initChunkedUpload(task) {
+  const params = new URLSearchParams({
+    file_name: task.file.name,
+    file_size: String(task.file.size),
+    mime_type: task.file.type || 'application/octet-stream',
+    path: task.path,
+  });
+  const r = await fetch(API+'/api/uploads/init?'+params.toString(), { method: 'POST' });
+  if (!r.ok) throw new Error(await responseError(r));
+  const d = await r.json();
+  task.sessionId = d.id;
+  task.loaded = d.received_size || 0;
+  task.progress = task.file.size ? task.loaded / task.file.size * 100 : 0;
+  task.result = d;
+}
+
+async function uploadChunks(task) {
+  while (task.loaded < task.file.size) {
+    if (task.paused || task.canceled) return;
+    const start = task.loaded;
+    const end = Math.min(start + BROWSER_CHUNK_SIZE, task.file.size);
+    const blob = task.file.slice(start, end);
+    const controller = new AbortController();
+    task.currentController = controller;
+    const before = Date.now();
+    const r = await fetch(API+'/api/uploads/'+task.sessionId+'/chunk?offset='+start, {
+      method: 'POST',
+      body: blob,
+      headers: { 'Content-Type': 'application/octet-stream' },
+      signal: controller.signal,
+    });
+    task.currentController = null;
+    if (!r.ok) {
+      let detail = await responseError(r);
+      // If server tells us the expected offset, trust it and continue from there.
+      try {
+        const obj = JSON.parse(detail);
+        const expected = obj.expected_offset ?? obj.detail?.expected_offset;
+        if (typeof expected === 'number') {
+          task.loaded = expected;
+          task.progress = task.file.size ? task.loaded / task.file.size * 100 : 0;
+          renderUploads();
+          continue;
+        }
+      } catch (_) {}
+      throw new Error(detail);
+    }
+    const d = await r.json();
+    task.loaded = d.received_size || end;
+    task.progress = task.file.size ? Math.max(0, Math.min(100, task.loaded / task.file.size * 100)) : 0;
+    const elapsed = Math.max(0.001, (Date.now() - before) / 1000);
+    task.speed = blob.size / elapsed;
+    task.result = d;
+    renderUploads();
+  }
+}
+
+async function commitUpload(task) {
+  const r = await fetch(API+'/api/uploads/'+task.sessionId+'/commit', { method: 'POST' });
+  if (!r.ok) throw new Error(await responseError(r));
+  const d = await r.json();
+  task.result = d;
+  task.status = 'telegram';
+  task.progress = 100;
+  task.telegramProgress = d.telegram_progress || 0;
+  toast(`${task.file.name} 已缓存，开始后台上传 Telegram`, 'success');
+  pollUploadSession(task);
 }
 
 function pauseUpload(id) {
   const task = uploads.get(id);
   if (!task) return;
   if (task.status === 'telegram') {
-    toast('后台 Telegram 上传暂不支持真正暂停；可取消任务或等待完成', 'error');
+    toast('后台 Telegram 上传已开始，暂不支持暂停；可取消任务或等待完成', 'error');
     return;
   }
-  if (task.status === 'queued') {
-    task.status = 'paused';
-    task.error = '已暂停，点击重新开始会从头上传';
-    renderUploads();
-    return;
-  }
-  if (task.xhr) {
-    task.abortReason = 'paused';
-    task.xhr.abort();
-  }
+  task.paused = true;
+  if (task.currentController) task.currentController.abort();
+  task.status = 'paused';
+  task.error = '已暂停，可从当前进度继续';
+  if (task.sessionId) fetch(API+'/api/uploads/'+task.sessionId+'/pause', { method: 'POST' }).catch(()=>{});
+  renderUploads();
+  startUploadQueue();
 }
 
 function resumeUpload(id) {
   const task = uploads.get(id);
-  if (!task || !['paused','canceled','error'].includes(task.status)) return;
+  if (!task || !['paused','error'].includes(task.status)) return;
   task.status = 'queued';
-  task.progress = 0;
-  task.loaded = 0;
-  task.speed = 0;
+  task.paused = false;
+  task.canceled = false;
   task.error = '';
-  task.abortReason = 'canceled';
   renderUploads();
   startUploadQueue();
 }
@@ -463,40 +479,32 @@ function resumeUpload(id) {
 async function cancelUpload(id) {
   const task = uploads.get(id);
   if (!task) return;
+  task.canceled = true;
   if (task.pollTimer) {
     clearTimeout(task.pollTimer);
     task.pollTimer = null;
   }
-  if (task.sessionId && task.status === 'telegram') {
+  if (task.currentController) task.currentController.abort();
+  if (task.sessionId) {
     try { await fetch(API+'/api/uploads/'+task.sessionId+'/cancel', { method: 'POST' }); } catch (_) {}
-    task.status = 'canceled';
-    task.error = '已取消后台任务（已开始的 Telegram 分片可能仍会完成当前片）';
-    renderUploads();
-    return;
   }
-  if (task.status === 'queued' || task.status === 'paused') {
-    task.status = 'canceled';
-    task.error = '已取消';
-    renderUploads();
-    return;
-  }
-  if (task.xhr) {
-    task.abortReason = 'canceled';
-    task.xhr.abort();
-  }
+  task.status = 'canceled';
+  task.error = task.status === 'telegram' ? '已取消后台任务（已开始的 Telegram 分片可能仍会完成当前片）' : '已取消';
+  renderUploads();
+  startUploadQueue();
 }
 
 function removeUpload(id) {
   const task = uploads.get(id);
   if (!task) return;
-  if (task.xhr) cancelUpload(id);
+  if (task.status === 'uploading' || task.status === 'telegram') cancelUpload(id);
   uploads.delete(id);
   renderUploads();
 }
 
 function clearFinishedUploads() {
   for (const [id, task] of uploads) {
-    if (['success','error','canceled','paused'].includes(task.status) && !task.xhr) uploads.delete(id);
+    if (['success','error','canceled','paused'].includes(task.status) && !task.currentController) uploads.delete(id);
   }
   renderUploads();
 }
@@ -514,8 +522,8 @@ function renderUploads() {
     const statusText = uploadStatusText(task);
     const resultText = task.result ? ` · ${task.result.mode || ''}${task.result.chunk_count ? ` · ${task.result.chunk_count} 片` : ''}${task.result.file_id ? ` · 文件ID ${task.result.file_id}` : ''}${task.sessionId ? ` · 任务 ${task.sessionId.slice(0,8)}` : ''}` : '';
     const canPause = task.status === 'uploading' || task.status === 'queued' || task.status === 'telegram';
-    const canResume = ['paused','canceled','error'].includes(task.status) && !task.sessionId;
-    const canCancel = ['uploading','queued','paused','telegram'].includes(task.status);
+    const canResume = ['paused','error'].includes(task.status) && task.sessionId;
+    const canCancel = ['uploading','queued','paused','telegram','error'].includes(task.status);
     return `<div class="upload-item upload-status-${task.status}">
       <div>
         <div class="upload-name">${esc(task.file.name)}</div>
@@ -532,9 +540,9 @@ function renderUploads() {
       </div>
       <div class="upload-actions">
         ${canPause ? `<button onclick="pauseUpload(${task.id})">暂停</button>` : ''}
-        ${canResume ? `<button onclick="resumeUpload(${task.id})">重新开始</button>` : ''}
+        ${canResume ? `<button onclick="resumeUpload(${task.id})">继续</button>` : ''}
         ${canCancel ? `<button class="danger" onclick="cancelUpload(${task.id})">取消</button>` : ''}
-        ${!task.xhr ? `<button onclick="removeUpload(${task.id})">移除</button>` : ''}
+        ${!task.currentController ? `<button onclick="removeUpload(${task.id})">移除</button>` : ''}
       </div>
     </div>`;
   }).join('');
@@ -582,6 +590,17 @@ function uploadStatusText(task) {
     error: '失败', canceled: '已取消', paused: '已暂停'
   }[task.status] || task.status;
 }
+
+async function responseError(r) {
+  const text = await r.text();
+  try {
+    const obj = JSON.parse(text);
+    return typeof obj.detail === 'string' ? obj.detail : JSON.stringify(obj.detail || obj);
+  } catch (_) {
+    return text || r.statusText || `HTTP ${r.status}`;
+  }
+}
+
 
 function webdavAbsoluteUrl() {
   return window.location.origin + '/dav/';
