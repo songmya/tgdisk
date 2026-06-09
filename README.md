@@ -150,3 +150,24 @@ WebUI 和 WebDAV 删除文件时都会进入回收站，而不是立刻彻底删
 - 彻底删除索引：`DELETE /api/trash/{file_id}`
 
 注意：彻底删除会先尽力调用 Telegram `deleteMessage` 删除原始上传消息/分片消息，再删除本地 SQLite 索引。但 Bot API 不能按 `file_id` 直接删除 Telegram 服务器文件，且 `deleteMessage` 可能受时间/权限限制，所以无法 100% 保证 Telegram 服务器文件被清除。
+
+### 自建 Telegram Bot API 与分片大小
+
+官方 Bot API 的 `sendDocument` 文件大小限制较低，所以默认 `TG_UPLOAD_CHUNK_SIZE_MB=18`，给 multipart/form-data 预留余量。
+如果使用自建 `telegram-bot-api`，可以同时配置 API 地址和更大的分片，例如：
+
+```env
+LOCAL_API_BASE=http://127.0.0.1:8081
+LOCAL_API_MODE=true
+TG_UPLOAD_CHUNK_SIZE_MB=512
+TG_SINGLE_UPLOAD_THRESHOLD_MB=512
+UPLOAD_CONCURRENCY=2
+```
+
+分片越大，请求数越少，但上传并发内存也会增加，峰值大约是：
+
+```text
+UPLOAD_CONCURRENCY × TG_UPLOAD_CHUNK_SIZE_MB
+```
+
+例如 `512MB × 2` 约需要 1GB 以上可用内存。

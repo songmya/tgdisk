@@ -14,14 +14,29 @@ from typing import AsyncIterator, Awaitable, Callable, Optional
 import aiohttp
 import aiosqlite
 
-from config import BOT_TOKEN, PROXY, ADMIN_IDS, DB_PATH, MAX_FILE_SIZE
+from config import BOT_TOKEN, PROXY, ADMIN_IDS, DB_PATH, MAX_FILE_SIZE, LOCAL_API_BASE
 
 logger = logging.getLogger(__name__)
 
 # ===== Telegram Bot API 限制 =====
-# sendDocument: 50MB；getFile: 20MB。统一按 18MB 切，留余量给 form 编码与协议头。
-CHUNK_SIZE = 18 * 1024 * 1024
-SINGLE_UPLOAD_THRESHOLD = 18 * 1024 * 1024
+# 官方 Bot API sendDocument 上限约 50MB；默认按 18MB 切，给 multipart/form-data 留余量。
+# 自建 telegram-bot-api 可通过环境变量把分片调大，减少分片数与请求数。
+def _env_size_mb(name: str, default_mb: int, min_mb: int = 1) -> int:
+    raw = os.getenv(name, str(default_mb)).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("%s=%r 非法，使用默认 %sMB", name, raw, default_mb)
+        value = default_mb
+    return max(min_mb, value) * 1024 * 1024
+
+CHUNK_SIZE = _env_size_mb("TG_UPLOAD_CHUNK_SIZE_MB", 18)
+SINGLE_UPLOAD_THRESHOLD = _env_size_mb(
+    "TG_SINGLE_UPLOAD_THRESHOLD_MB",
+    max(1, CHUNK_SIZE // (1024 * 1024)),
+)
+TG_API_BASE = (LOCAL_API_BASE or "https://api.telegram.org").rstrip("/")
+TG_FILE_BASE = TG_API_BASE.replace("/bot", "").rstrip("/")
 
 # 并发参数
 UPLOAD_CONCURRENCY = int(os.getenv("UPLOAD_CONCURRENCY", "4"))
@@ -47,7 +62,7 @@ async def _tg_send_document(
     if caption:
         form.add_field("caption", caption)
     async with session.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument",
+        f"{TG_API_BASE}/bot{BOT_TOKEN}/sendDocument",
         data=form, proxy=proxy,
         timeout=aiohttp.ClientTimeout(total=600),
     ) as resp:
@@ -58,7 +73,7 @@ async def _tg_delete_message(session: aiohttp.ClientSession, chat_id: int, messa
     """deleteMessage。注意：Telegram 可能因为时间限制/权限限制拒绝删除。"""
     proxy = PROXY or None
     async with session.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/deleteMessage",
+        f"{TG_API_BASE}/bot{BOT_TOKEN}/deleteMessage",
         json={"chat_id": chat_id, "message_id": message_id},
         proxy=proxy,
         timeout=aiohttp.ClientTimeout(total=60),
@@ -138,7 +153,7 @@ async def delete_tg_messages_for_file(file_id_int: int) -> dict:
 async def _tg_get_file_url(session: aiohttp.ClientSession, file_id: str) -> Optional[str]:
     proxy = PROXY or None
     async with session.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/getFile",
+        f"{TG_API_BASE}/bot{BOT_TOKEN}/getFile",
         json={"file_id": file_id}, proxy=proxy,
         timeout=aiohttp.ClientTimeout(total=60),
     ) as resp:
@@ -146,7 +161,7 @@ async def _tg_get_file_url(session: aiohttp.ClientSession, file_id: str) -> Opti
     if not data.get("ok"):
         logger.error("getFile failed: %s", data)
         return None
-    return f"https://api.telegram.org/file/bot{BOT_TOKEN}/{data['result']['file_path']}"
+    return f"{TG_FILE_BASE}/file/bot{BOT_TOKEN}/{data['result']['file_path']}"
 
 
 async def _send_with_retry(
@@ -272,8 +287,8 @@ async def upload_stream_to_tg(
             first, file_name, mime_type, dest_path, uploader_id)
 
     # ===== 切片路径 =====
-    # 此时 first 已经超过 SINGLE_UPLOAD_THRESHOLD（实际是 18MB+1 字节）
-    # 我们把 first 重新切成 18MB 的 chunk_index=0，剩余字节预留到下一次累计
+    # 此时 first 已经超过 SINGLE_UPLOAD_THRESHOLD。
+    # 我们把 first 重新切成 CHUNK_SIZE 的 chunk_index=0，剩余字节预留到下一次累计。
     pending = first
     file_type = guess_file_type(mime_type)
 
