@@ -17,7 +17,8 @@ from database import init_db
 from config import DB_PATH, BOT_TOKEN, PROXY, ADMIN_IDS, MAX_FILE_SIZE
 from tg_io import (upload_local_file_to_tg, upload_stream_to_tg,
                    stream_file_by_id, resume_chunks, cleanup_orphans,
-                   SINGLE_UPLOAD_THRESHOLD, CHUNK_SIZE)
+                   SINGLE_UPLOAD_THRESHOLD, CHUNK_SIZE,
+                   delete_tg_messages_for_file)
 from upload_cache import (
     UPLOAD_CACHE_ENABLED,
     init_upload_cache,
@@ -386,9 +387,12 @@ async def api_restore_file(file_id: int):
 
 
 @app.delete("/api/trash/{file_id}")
-async def api_purge_file(file_id: int):
-    """从回收站彻底删除索引。"""
+async def api_purge_file(file_id: int, delete_tg: bool = Query(True)):
+    """从回收站彻底删除索引；默认先尽力删除 Telegram 消息。"""
     from database import FileDB
+    tg_delete = {"skipped": True}
+    if delete_tg:
+        tg_delete = await delete_tg_messages_for_file(file_id)
     db = await aiosqlite.connect(DB_PATH)
     db.row_factory = aiosqlite.Row
     try:
@@ -396,7 +400,7 @@ async def api_purge_file(file_id: int):
         success = await file_db.purge_file(file_id)
         if not success:
             raise HTTPException(404, "文件不存在或不在回收站")
-        return {"ok": True}
+        return {"ok": True, "tg_delete": tg_delete}
     finally:
         await db.close()
 

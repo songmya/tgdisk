@@ -54,6 +54,87 @@ async def _tg_send_document(
         return await resp.json()
 
 
+async def _tg_delete_message(session: aiohttp.ClientSession, chat_id: int, message_id: int) -> dict:
+    """deleteMessage。注意：Telegram 可能因为时间限制/权限限制拒绝删除。"""
+    proxy = PROXY or None
+    async with session.post(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/deleteMessage",
+        json={"chat_id": chat_id, "message_id": message_id},
+        proxy=proxy,
+        timeout=aiohttp.ClientTimeout(total=60),
+    ) as resp:
+        return await resp.json()
+
+
+async def delete_tg_messages_for_file(file_id_int: int) -> dict:
+    """尽力删除一个文件对应的 Telegram 消息。
+
+    Bot API 不能按 file_id 删除 Telegram 服务器文件，只能删除当初 Bot 发送的
+    message。multipart 文件会删除主记录消息和所有分片消息。
+    """
+    targets: list[tuple[int, int, str]] = []
+    db = await aiosqlite.connect(DB_PATH)
+    db.row_factory = aiosqlite.Row
+    try:
+        cursor = await db.execute(
+            "SELECT id, message_id, chat_id FROM files WHERE id=?",
+            (file_id_int,),
+        )
+        f = await cursor.fetchone()
+        if not f:
+            return {"ok": False, "deleted": 0, "failed": 0, "errors": ["文件索引不存在"]}
+        if f["chat_id"] and f["message_id"]:
+            targets.append((int(f["chat_id"]), int(f["message_id"]), "file"))
+        cursor = await db.execute(
+            "SELECT chunk_index, message_id, chat_id FROM file_chunks WHERE file_id_int=? ORDER BY chunk_index",
+            (file_id_int,),
+        )
+        for c in await cursor.fetchall():
+            if c["chat_id"] and c["message_id"]:
+                targets.append((int(c["chat_id"]), int(c["message_id"]), f"chunk:{c['chunk_index']}"))
+    finally:
+        await db.close()
+
+    # 去重：multipart 第 0 片可能和主记录 message 相同。
+    seen = set()
+    uniq = []
+    for chat_id, message_id, kind in targets:
+        key = (chat_id, message_id)
+        if key not in seen:
+            seen.add(key)
+            uniq.append((chat_id, message_id, kind))
+
+    deleted = 0
+    errors = []
+    async with aiohttp.ClientSession() as session:
+        for chat_id, message_id, kind in uniq:
+            try:
+                res = await _tg_delete_message(session, chat_id, message_id)
+                if res.get("ok"):
+                    deleted += 1
+                else:
+                    errors.append({
+                        "kind": kind,
+                        "chat_id": chat_id,
+                        "message_id": message_id,
+                        "error": res.get("description", "unknown"),
+                    })
+            except Exception as e:
+                errors.append({
+                    "kind": kind,
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "error": str(e),
+                })
+    return {
+        "ok": len(errors) == 0,
+        "attempted": len(uniq),
+        "deleted": deleted,
+        "failed": len(errors),
+        "errors": errors,
+    }
+
+
 async def _tg_get_file_url(session: aiohttp.ClientSession, file_id: str) -> Optional[str]:
     proxy = PROXY or None
     async with session.post(

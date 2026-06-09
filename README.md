@@ -149,4 +149,4 @@ WebUI 和 WebDAV 删除文件时都会进入回收站，而不是立刻彻底删
 - 恢复：`POST /api/trash/{file_id}/restore`
 - 彻底删除索引：`DELETE /api/trash/{file_id}`
 
-注意：彻底删除只删除本地 SQLite 索引；Telegram 服务器上的文件不一定会被删除。
+注意：彻底删除会先尽力调用 Telegram `deleteMessage` 删除原始上传消息/分片消息，再删除本地 SQLite 索引。但 Bot API 不能按 `file_id` 直接删除 Telegram 服务器文件，且 `deleteMessage` 可能受时间/权限限制，所以无法 100% 保证 Telegram 服务器文件被清除。
