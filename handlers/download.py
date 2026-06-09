@@ -49,6 +49,18 @@ async def cmd_get(message: types.Message):
             await message.answer(f"❌ 文件 ID {file_id_int} 不存在")
             return
 
+        # 多分片文件：Bot 不能直接推送 >50MB，引导用户走 Web
+        if f.get("is_multipart"):
+            await message.answer(
+                f"📦 *{f['file_name']}*\n"
+                f"该文件为分片文件（{f.get('chunk_count', '?')} 片，总大小 "
+                f"{format_size(f['file_size'])}）。\n"
+                f"超过 Bot API 50MB 推送上限，请通过 Web UI 下载：\n"
+                f"`/api/proxy-download/{file_id_int}`",
+                parse_mode="Markdown",
+            )
+            return
+
         # 根据文件类型选择发送方式
         tg_file_id = f["file_id"]
         file_type = f["file_type"]

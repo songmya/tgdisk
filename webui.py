@@ -1,9 +1,11 @@
 """TGDrive Web UI - FastAPI 后端"""
 
 import os
+import hashlib
+import asyncio
 import aiosqlite
 from pathlib import Path
-from fastapi import FastAPI, Query, HTTPException, UploadFile, File
+from fastapi import FastAPI, Query, HTTPException, UploadFile, File, Request
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,6 +13,9 @@ import uvicorn
 
 import config
 from config import DB_PATH, BOT_TOKEN, PROXY, ADMIN_IDS, MAX_FILE_SIZE
+from tg_io import (upload_local_file_to_tg, upload_stream_to_tg,
+                   stream_file_by_id, resume_chunks, cleanup_orphans,
+                   SINGLE_UPLOAD_THRESHOLD, CHUNK_SIZE)
 
 app = FastAPI(title="TGDrive Web")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -145,103 +150,30 @@ async def api_dirs(path: str = Query("/")):
 
 @app.post("/api/upload")
 async def api_upload(file: UploadFile, path: str = "/"):
-    """网页端上传文件"""
-    import aiohttp
-    import tempfile
-    
-    # 验证文件名
+    """网页端上传：流式切片，不落盘（峰值内存 ≈ UPLOAD_CONCURRENCY × 18MB）。"""
     filename = file.filename or "upload.bin"
     mime_type = file.content_type or "application/octet-stream"
-    
-    # 保存到临时文件
-    fd, tmp_path = tempfile.mkstemp()
+
+    async def reader(n: int) -> bytes:
+        # 注意：UploadFile.read(n) 不保证返回刚好 n 字节，常见返回 < n
+        # upload_stream_to_tg 会处理这种。
+        return await file.read(n)
+
     try:
-        size = 0
-        with open(tmp_path, "wb") as f:
-            while chunk := await file.read(1024 * 1024):  # 1MB 块
-                f.write(chunk)
-                size += len(chunk)
-                
-        if size > MAX_FILE_SIZE * 1024 * 1024:
-            raise HTTPException(400, f"文件过大，最大允许 {MAX_FILE_SIZE}MB")
-            
-        if size > 50 * 1024 * 1024:
-            # Bot API 官方限制直接上传不能超过 50MB
-            # 除非自建 API Server
-            raise HTTPException(400, "Web直传目前受Bot API限制，请勿超过50MB。大于50MB请在Telegram中发给Bot。")
-
-        # 使用 form-data 上传到 Telegram
-        proxy = PROXY or None
-        async with aiohttp.ClientSession() as s:
-            with open(tmp_path, "rb") as f:
-                data = aiohttp.FormData()
-                data.add_field("chat_id", str(ADMIN_IDS[0])) # 默认传给第一个管理员
-                data.add_field("document", f, filename=filename, content_type=mime_type)
-                
-                # caption 用于让 bot 识别路径
-                if path != "/":
-                    data.add_field("caption", f"{path} (Web上传)")
-                else:
-                    data.add_field("caption", "来自 Web 的上传")
-
-                async with s.post(
-                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument",
-                    data=data,
-                    proxy=proxy,
-                    timeout=300
-                ) as resp:
-                    res = await resp.json()
-                    
-        if not res.get("ok"):
-            raise HTTPException(400, f"上传到 Telegram 失败: {res.get('description', '')}")
-            
-        msg = res.get("result", {})
-        doc = msg.get("document", {})
-        if not doc:
-            raise HTTPException(400, "未收到文档对象")
-            
-        file_id = doc.get("file_id")
-        file_unique_id = doc.get("file_unique_id")
-        tg_size = doc.get("file_size", size)
-        
-        # 写入数据库 (Bot polling 会收到，但由于我们用 bot 自己发给自己，可能会被忽略，或者重复记录，所以最好主动写入)
-        from database import FileDB
-        db = await aiosqlite.connect(DB_PATH)
-        db.row_factory = aiosqlite.Row
-        try:
-            file_db = FileDB(db)
-            
-            # 确定类型
-            file_type = "document"
-            if mime_type.startswith("image/"): file_type = "photo"
-            elif mime_type.startswith("video/"): file_type = "video"
-            elif mime_type.startswith("audio/"): file_type = "audio"
-            
-            # 插入
-            await file_db.add_file(
-                file_id=file_id,
-                file_unique_id=file_unique_id,
-                file_name=filename,
-                file_size=tg_size,
-                mime_type=mime_type,
-                file_type=file_type,
-                path=path,
-                uploader_id=ADMIN_IDS[0], # web 默认 admin 0
-                message_id=msg.get("message_id", 0),
-                chat_id=msg.get("chat", {}).get("id", 0)
-            )
-        finally:
-            await db.close()
-            
-        return {"ok": True, "file_name": filename, "size": tg_size, "path": path}
-
+        return await upload_stream_to_tg(
+            reader=reader, file_name=filename, mime_type=mime_type,
+            dest_path=path, uploader_id=ADMIN_IDS[0],
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        raise HTTPException(502, str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         import traceback
         traceback.print_exc()
         raise HTTPException(500, str(e))
-    finally:
-        os.close(fd)
-        os.remove(tmp_path)
 
 
 @app.post("/api/mkdir")
@@ -277,51 +209,111 @@ async def api_delete(file_id: int):
     finally:
         await db.close()
 @app.get("/api/proxy-download/{file_id}")
-@app.get("/api/proxy-download/{file_id}")
-async def proxy_download(file_id: int):
-    """通过后端代理下载文件（适合国内网络）"""
-    import aiohttp
-    from starlette.responses import StreamingResponse
+async def proxy_download(file_id: int, request: Request):
+    """后端代理下载，支持 Range 请求。单文件 / multipart 自动识别。"""
+    from starlette.responses import StreamingResponse, Response
 
     row = await query_db(
-        "SELECT file_id, file_name, file_size, mime_type FROM files WHERE id=? AND deleted=0",
+        "SELECT id, file_name, file_size, mime_type, is_multipart, chunk_count "
+        "FROM files WHERE id=? AND deleted=0",
         (file_id,),
     )
     if not row:
         raise HTTPException(404, "文件不存在")
 
     f = row[0]
-    proxy = PROXY or None
-    
-    # We must return a StreamingResponse that yields chunks.
-    # To do this safely with aiohttp session, we wrap it in an async generator.
-    async def stream_telegram_file():
-        async with aiohttp.ClientSession() as s:
-            async with s.post(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/getFile",
-                json={"file_id": f["file_id"]},
-                proxy=proxy,
-            ) as resp:
-                data = await resp.json()
-            if not data.get("ok"):
-                yield b""
-                return
+    total = f["file_size"]
+    range_header = request.headers.get("range") or request.headers.get("Range")
 
-            tg_path = data["result"]["file_path"]
-            tg_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{tg_path}"
+    headers = {
+        "Content-Disposition": f'attachment; filename="{f["file_name"]}"',
+        "Content-Type": f["mime_type"] or "application/octet-stream",
+        "Accept-Ranges": "bytes",
+    }
+    if f.get("is_multipart"):
+        headers["X-TGDrive-Multipart"] = str(f["chunk_count"])
 
-            async with s.get(tg_url, proxy=proxy) as tg_resp:
-                async for chunk in tg_resp.content.iter_chunked(64 * 1024):
-                    yield chunk
+    # 解析 Range
+    start, end = 0, total - 1
+    status = 200
+    if range_header and range_header.startswith("bytes="):
+        try:
+            spec = range_header[6:].split(",")[0].strip()
+            a, _, b = spec.partition("-")
+            if a:
+                start = int(a)
+            if b:
+                end = int(b)
+            if start < 0 or end >= total or start > end:
+                return Response(status_code=416,
+                                headers={"Content-Range": f"bytes */{total}"})
+            status = 206
+            headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+        except ValueError:
+            pass
 
+    headers["Content-Length"] = str(end - start + 1)
     return StreamingResponse(
-        stream_telegram_file(),
-        headers={
-            "Content-Disposition": f'attachment; filename="{f["file_name"]}"',
-            "Content-Type": f["mime_type"] or "application/octet-stream",
-            "Content-Length": str(f["file_size"]),
-        },
+        stream_file_by_id(file_id, range_start=start, range_end=end),
+        headers=headers, status_code=status,
     )
+
+
+@app.get("/api/upload-status/{file_id}")
+async def api_upload_status(file_id: int):
+    """查看一个 multipart 上传的进度与缺失分片。"""
+    from database import FileDB
+    db = await aiosqlite.connect(DB_PATH)
+    db.row_factory = aiosqlite.Row
+    try:
+        cursor = await db.execute(
+            "SELECT id, file_name, file_size, chunk_count, is_multipart, deleted "
+            "FROM files WHERE id=?", (file_id,))
+        row = await cursor.fetchone()
+        if not row or not row["is_multipart"]:
+            raise HTTPException(404, "文件不存在或不是 multipart")
+        fdb = FileDB(db)
+        missing = await fdb.get_missing_chunks(file_id)
+    finally:
+        await db.close()
+    return {
+        "file_id": file_id,
+        "file_name": row["file_name"],
+        "file_size": row["file_size"],
+        "chunk_count": row["chunk_count"],
+        "missing": missing,
+        "complete": len(missing) == 0,
+        "deleted": bool(row["deleted"]),
+    }
+
+
+@app.post("/api/resume-upload/{file_id}")
+async def api_resume_upload(file_id: int, source_path: str = Query(...)):
+    """从本地 source_path 文件重传 file_id 的缺失分片。
+    注意：source_path 必须是服务器本地可读路径（临时上传后未订零的供重传用）。
+    仅限本地/运维使用。"""
+    from database import FileDB
+    if not os.path.isfile(source_path):
+        raise HTTPException(400, f"source_path 不存在: {source_path}")
+    db = await aiosqlite.connect(DB_PATH)
+    db.row_factory = aiosqlite.Row
+    try:
+        fdb = FileDB(db)
+        missing = await fdb.get_missing_chunks(file_id)
+    finally:
+        await db.close()
+    if not missing:
+        return {"ok": True, "already_complete": True}
+    try:
+        return await resume_chunks(file_id, missing, source_path)
+    except RuntimeError as e:
+        raise HTTPException(502, str(e))
+
+
+@app.post("/api/cleanup-orphans")
+async def api_cleanup_orphans(hours: int = Query(24), apply: bool = Query(False)):
+    """查找 / 清理 hours 小时前未集齐分片的 multipart 文件。默认 dry_run。"""
+    return await cleanup_orphans(hours=hours, dry_run=not apply)
 
 
 if __name__ == "__main__":

@@ -44,8 +44,29 @@ async def init_db():
                 chat_id INTEGER,
                 created_at TEXT DEFAULT (datetime('now', 'localtime')),
                 deleted INTEGER DEFAULT 0,
+                is_multipart INTEGER DEFAULT 0,
+                chunk_count INTEGER DEFAULT 0,
+                total_sha256 TEXT DEFAULT '',
                 FOREIGN KEY (uploader_id) REFERENCES users(telegram_id)
             );
+
+            CREATE TABLE IF NOT EXISTS file_chunks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_id_int INTEGER NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                tg_file_id TEXT NOT NULL,
+                tg_file_unique_id TEXT,
+                chunk_size INTEGER NOT NULL,
+                chunk_sha256 TEXT DEFAULT '',
+                status TEXT DEFAULT 'ok',
+                message_id INTEGER,
+                chat_id INTEGER,
+                created_at TEXT DEFAULT (datetime('now', 'localtime')),
+                UNIQUE(file_id_int, chunk_index),
+                FOREIGN KEY (file_id_int) REFERENCES files(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_chunks_file ON file_chunks(file_id_int, chunk_index);
 
             CREATE INDEX IF NOT EXISTS idx_files_path ON files(path);
             CREATE INDEX IF NOT EXISTS idx_files_name ON files(file_name);
@@ -64,6 +85,19 @@ async def init_db():
             CREATE INDEX IF NOT EXISTS idx_dirs_path ON dirs(path);
             CREATE INDEX IF NOT EXISTS idx_dirs_parent ON dirs(parent_path);
         """)
+
+        # 老库升级：为已存在的 files 表补上 multipart 列（幂等）
+        async def _ensure_column(table: str, col: str, ddl: str):
+            cursor = await db.execute(f"PRAGMA table_info({table})")
+            cols = [row[1] for row in await cursor.fetchall()]
+            if col not in cols:
+                await db.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+
+        await _ensure_column("files", "is_multipart", "is_multipart INTEGER DEFAULT 0")
+        await _ensure_column("files", "chunk_count", "chunk_count INTEGER DEFAULT 0")
+        await _ensure_column("files", "total_sha256", "total_sha256 TEXT DEFAULT ''")
+        await _ensure_column("file_chunks", "status", "status TEXT DEFAULT 'ok'")
+
         await db.commit()
     finally:
         await db.close()
@@ -163,6 +197,86 @@ class FileDB:
         )
         row = await cursor.fetchone()
         return dict(row)
+
+    async def add_multipart_file(self, file_name: str, file_size: int, mime_type: str,
+                                  file_type: str, path: str, uploader_id: int,
+                                  chunk_count: int, total_sha256: str,
+                                  tags: str = "") -> int:
+        """创建多分片主文件记录（file_id 为第一个分片的 file_id，后续 update）"""
+        await self.db.execute(
+            """INSERT INTO files (file_id, file_unique_id, file_name, file_size,
+               mime_type, file_type, path, tags, uploader_id, message_id, chat_id,
+               is_multipart, chunk_count, total_sha256)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)""",
+            ("", "", file_name, file_size, mime_type, file_type, path, tags,
+             uploader_id, 0, 0, chunk_count, total_sha256)
+        )
+        await self.db.commit()
+        cursor = await self.db.execute("SELECT last_insert_rowid()")
+        row = await cursor.fetchone()
+        return row[0]
+
+    async def add_chunk(self, file_id_int: int, chunk_index: int,
+                        tg_file_id: str, tg_file_unique_id: str,
+                        chunk_size: int, chunk_sha256: str,
+                        message_id: int = 0, chat_id: int = 0) -> int:
+        """插入一个分片记录"""
+        await self.db.execute(
+            """INSERT INTO file_chunks (file_id_int, chunk_index, tg_file_id,
+               tg_file_unique_id, chunk_size, chunk_sha256, message_id, chat_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (file_id_int, chunk_index, tg_file_id, tg_file_unique_id,
+             chunk_size, chunk_sha256, message_id, chat_id)
+        )
+        await self.db.commit()
+        cursor = await self.db.execute("SELECT last_insert_rowid()")
+        row = await cursor.fetchone()
+        return row[0]
+
+    async def get_chunks(self, file_id_int: int) -> list[dict]:
+        """按顺序获取一个多分片文件的所有分片"""
+        cursor = await self.db.execute(
+            """SELECT * FROM file_chunks WHERE file_id_int = ?
+               ORDER BY chunk_index ASC""",
+            (file_id_int,)
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_missing_chunks(self, file_id_int: int) -> list[int]:
+        """返回一个多分片文件中缺失 / 失败的 chunk_index 列表。"""
+        cursor = await self.db.execute(
+            "SELECT chunk_count FROM files WHERE id=? AND is_multipart=1",
+            (file_id_int,))
+        row = await cursor.fetchone()
+        if not row:
+            return []
+        total = row[0]
+        cursor = await self.db.execute(
+            "SELECT chunk_index FROM file_chunks WHERE file_id_int=? AND status='ok'",
+            (file_id_int,))
+        present = {r[0] for r in await cursor.fetchall()}
+        return [i for i in range(total) if i not in present]
+
+    async def mark_chunk_status(self, file_id_int: int, chunk_index: int, status: str):
+        await self.db.execute(
+            "UPDATE file_chunks SET status=? WHERE file_id_int=? AND chunk_index=?",
+            (status, file_id_int, chunk_index))
+        await self.db.commit()
+
+    async def list_orphan_multipart(self, hours: int = 24) -> list[dict]:
+        """列出超过 hours 小时仍未集齐分片的 multipart 记录。hours<0 仅供测试。"""
+        modifier = f'{-abs(hours)} hours' if hours >= 0 else f'+{abs(hours)} hours'
+        cursor = await self.db.execute(
+            """SELECT f.id, f.file_name, f.file_size, f.chunk_count, f.created_at,
+                      COUNT(CASE WHEN c.status='ok' THEN 1 END) AS got
+               FROM files f LEFT JOIN file_chunks c ON c.file_id_int=f.id
+               WHERE f.is_multipart=1 AND f.deleted=0
+                 AND datetime(f.created_at) <= datetime('now','localtime', ?)
+               GROUP BY f.id
+               HAVING got < f.chunk_count""",
+            (modifier,))
+        return [dict(r) for r in await cursor.fetchall()]
 
 
 class DirDB:

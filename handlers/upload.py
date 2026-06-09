@@ -31,6 +31,13 @@ async def handle_file(message: types.Message):
         await message.answer("❌ 你没有使用权限")
         return
 
+    # 拦截 Web 上传产生的辅助消息，避免重复入库
+    caption = message.caption or ""
+    if "(Web单传)" in caption or caption.startswith("【分片 ") or \
+       "来自 Web 的上传" in caption:
+        logger.info(f"跳过 Web 辅助消息: {caption[:40]}")
+        return
+
     # 提取文件信息
     file_id = ""
     file_unique_id = ""
@@ -111,7 +118,6 @@ async def handle_file(message: types.Message):
 
     # 解析上传路径（从 caption 中提取，格式：/path/filename）
     upload_path = "/"
-    caption = message.caption or ""
     if caption.startswith("/"):
         parts = caption.strip().split()
         if parts:

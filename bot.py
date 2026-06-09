@@ -8,10 +8,11 @@ from pathlib import Path
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.telegram import TelegramAPIServer
 from aiogram.enums import ParseMode
 
 import config
-from config import BOT_TOKEN, PROXY, LOG_LEVEL
+from config import BOT_TOKEN, PROXY, LOG_LEVEL, LOCAL_API_BASE, LOCAL_API_MODE
 from database import init_db
 
 # 日志
@@ -26,20 +27,30 @@ logger = logging.getLogger(__name__)
 def create_bot() -> tuple[Bot, Dispatcher]:
     """创建 Bot 和 Dispatcher"""
 
-    # 代理设置
+    # 自建 Bot API Server
+    api_server = None
+    if LOCAL_API_BASE:
+        api_server = TelegramAPIServer.from_base(LOCAL_API_BASE, is_local=LOCAL_API_MODE)
+        logger.info(f"使用自建 Bot API Server: {LOCAL_API_BASE} (local_mode={LOCAL_API_MODE})")
+
+    # 代理设置（连接自建服务器通常不需要代理）
     session = None
-    if PROXY:
+    use_proxy = PROXY and not LOCAL_API_BASE
+    if use_proxy:
         logger.info(f"使用代理: {PROXY}")
         if PROXY.startswith("socks5://") or PROXY.startswith("socks4://"):
             # SOCKS 代理 - 通过环境变量让 python-socks 处理
             import os
             os.environ["ALL_PROXY"] = PROXY
             logger.info(f"SOCKS 代理已通过环境变量配置")
-            session = AiohttpSession(proxy=PROXY)
+            session = AiohttpSession(proxy=PROXY, api=api_server) if api_server else AiohttpSession(proxy=PROXY)
         else:
             # HTTP/HTTPS 代理 - aiohttp 原生支持
-            session = AiohttpSession(proxy=PROXY)
+            session = AiohttpSession(proxy=PROXY, api=api_server) if api_server else AiohttpSession(proxy=PROXY)
             logger.info(f"HTTP 代理已配置: {PROXY}")
+    elif api_server:
+        # 只用自建服务器，不走代理
+        session = AiohttpSession(api=api_server)
 
     # 创建 Bot
     if session:
