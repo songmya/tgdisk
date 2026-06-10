@@ -41,8 +41,17 @@ def main():
     r = client.put("/dav/put-dir/", content=b"")
     assert r.status_code == 201, (r.status_code, r.text[:200])
 
+    # gitdisk-compatible fallback: some clients PROPFIND a missing folder target
+    # before MKCOL, then abort on 404. Likely folder paths are lazily created.
+    r = client.request("PROPFIND", "/dav/lazy-dir", headers={"Depth": "0"})
+    assert r.status_code == 207, (r.status_code, r.text[:200])
+
+    # Obvious file paths must not be auto-created as folders.
+    r = client.request("PROPFIND", "/dav/not-a-folder.txt", headers={"Depth": "0"})
+    assert r.status_code == 404, (r.status_code, r.text[:200])
+
     got = asyncio.run(rows())
-    assert {r["path"] for r in got} == {"/mkcol-dir", "/put-dir"}, got
+    assert {r["path"] for r in got} == {"/mkcol-dir", "/put-dir", "/lazy-dir"}, got
     print("smoke_webdav_mkdir: OK")
 
 

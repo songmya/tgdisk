@@ -14,6 +14,7 @@ import aiosqlite
 import logging
 import tempfile
 from io import BytesIO
+from pathlib import PurePosixPath
 from typing import Optional
 from wsgidav.dav_provider import DAVProvider, DAVCollection, DAVNonCollection
 from wsgidav import util
@@ -61,6 +62,27 @@ def run_async(coro):
     """Run a coroutine from WsgiDAV's synchronous callbacks on a shared loop."""
     future = asyncio.run_coroutine_threadsafe(coro, _ensure_async_loop())
     return future.result()
+
+
+def _parent_path(path: str) -> str:
+    p = normalize_path(path)
+    if p == "/":
+        return "/"
+    return normalize_path(str(PurePosixPath(p).parent))
+
+
+def _base_name(path: str) -> str:
+    return PurePosixPath(normalize_path(path)).name
+
+
+def _looks_like_dir_path(path: str) -> bool:
+    """Heuristic copied from gitdisk for clients that PROPFIND before MKCOL.
+
+    Avoid auto-creating obvious file paths like /movie.mp4 or /a/b.txt.
+    Folder names with dots still work through proper MKCOL or empty PUT /name/.
+    """
+    name = _base_name(path)
+    return bool(name) and "." not in name
 
 
 class _TGStreamReader(io.RawIOBase):
@@ -493,6 +515,14 @@ class TGDriveProvider(DAVProvider):
                     if request_method == "PUT":
                         child_path = curr.path + part if curr.path.endswith("/") else curr.path + "/" + part
                         return TempUploadFile(child_path, environ, curr.db_path, part)
+                    # Compatibility copied from gitdisk: some WebDAV clients
+                    # PROPFIND the target folder first and abort if it gets a
+                    # standards-compliant 404 before sending MKCOL. Lazily create
+                    # likely folder targets so "New Folder" works in those clients.
+                    if request_method == "PROPFIND" and _looks_like_dir_path(path):
+                        created = run_async(self._create_dir_if_parent_exists(path))
+                        if created:
+                            return TelegramFolder(normalize_path(path), environ, normalize_path(path))
                     # MKCOL 必须让 WsgiDAV 看到目标 URL 尚未映射，随后由父目录
                     # create_collection() 创建；这里不能返回临时文件对象。
                     return None
@@ -503,6 +533,18 @@ class TGDriveProvider(DAVProvider):
                     return None
             
         return curr
+
+    async def _create_dir_if_parent_exists(self, path: str) -> bool:
+        db = await aiosqlite.connect(DB_PATH)
+        db.row_factory = aiosqlite.Row
+        try:
+            dir_db = DirDB(db)
+            parent = _parent_path(path)
+            if parent != "/" and not await dir_db.dir_exists(parent):
+                return False
+            return bool(await dir_db.create_dir(_base_name(path), parent))
+        finally:
+            await db.close()
         
     def get_custom_property(self, path, name):
         return None
