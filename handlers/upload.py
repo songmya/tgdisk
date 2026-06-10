@@ -107,14 +107,15 @@ async def handle_file(message: types.Message):
         await message.answer("❌ 不支持的文件类型")
         return
 
-    # 检查文件大小
-    max_bytes = MAX_FILE_SIZE * 1024 * 1024
-    if file_size > max_bytes:
-        await message.answer(
-            f"❌ 文件过大：{format_size(file_size)}\n"
-            f"最大限制：{MAX_FILE_SIZE} MB"
-        )
-        return
+    # 检查文件大小；MAX_FILE_SIZE=0 表示不限
+    if MAX_FILE_SIZE > 0:
+        max_bytes = MAX_FILE_SIZE * 1024 * 1024
+        if file_size > max_bytes:
+            await message.answer(
+                f"❌ 文件过大：{format_size(file_size)}\n"
+                f"最大限制：{MAX_FILE_SIZE} MB"
+            )
+            return
 
     # 解析上传路径（从 caption 中提取，格式：/path/filename）
     upload_path = "/"
