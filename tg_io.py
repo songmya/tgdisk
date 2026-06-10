@@ -9,6 +9,7 @@ import os
 import asyncio
 import hashlib
 import logging
+import io
 from typing import AsyncIterator, Awaitable, Callable, Optional
 
 import aiohttp
@@ -55,6 +56,11 @@ UPLOAD_CONCURRENCY = int(os.getenv("UPLOAD_CONCURRENCY", "4"))
 UPLOAD_RETRY = 3
 UPLOAD_RETRY_BACKOFF = 1.5  # 秒，乘以 attempt+1
 
+# 自建 Bot API local mode 策略：≤1500MB 单文件上传，>1500MB 按 1500MB 分片。
+# Telegram 自建 Bot API 常见单文件上限约 2GB，留安全余量。
+LOCAL_SINGLE_UPLOAD_LIMIT = _env_size_mb("TG_LOCAL_SINGLE_UPLOAD_LIMIT_MB", 1500)
+LOCAL_PART_SIZE = _env_size_mb("TG_LOCAL_PART_SIZE_MB", 1500)
+
 
 # ---------- 基础调用 ----------
 
@@ -81,6 +87,38 @@ async def _tg_send_document(
         return await resp.json()
 
 
+class _LimitedFileReader(io.IOBase):
+    """限制读取范围的同步文件对象，供 aiohttp multipart 流式上传分片。"""
+
+    def __init__(self, path: str, offset: int = 0, size: Optional[int] = None):
+        self._file = open(path, "rb")
+        self._file.seek(offset)
+        self._remaining = size
+        self._closed = False
+
+    def readable(self):
+        return True
+
+    def read(self, n: int = -1):
+        if self._closed:
+            return b""
+        if self._remaining is not None:
+            if self._remaining <= 0:
+                return b""
+            if n is None or n < 0 or n > self._remaining:
+                n = self._remaining
+        data = self._file.read(n)
+        if self._remaining is not None:
+            self._remaining -= len(data)
+        return data
+
+    def close(self):
+        if not self._closed:
+            self._closed = True
+            self._file.close()
+        super().close()
+
+
 async def _tg_send_document_file(
     session: aiohttp.ClientSession,
     chat_id: int,
@@ -88,18 +126,22 @@ async def _tg_send_document_file(
     filename: str,
     mime_type: str,
     caption: str = "",
+    offset: int = 0,
+    size: Optional[int] = None,
 ) -> dict:
     """sendDocument(local mode): 从本地文件对象流式上传。
 
     telegram-bot-api 的 HTTP JSON 参数不会把 /path 当作本地文件路径；它会按
     URL/file_id 解析。这里改用 multipart + file object，aiohttp 会从磁盘分块
     读取并发送给本地 Bot API，避免把大文件整体读进 Python 内存。
+    offset/size 用于大文件按 1500MB 逻辑分片时只上传文件中的指定范围。
     """
     form = aiohttp.FormData()
     form.add_field("chat_id", str(chat_id))
     if caption:
         form.add_field("caption", caption)
-    with open(local_path, "rb") as f:
+    f = _LimitedFileReader(local_path, offset=offset, size=size)
+    try:
         form.add_field("document", f, filename=filename, content_type=mime_type)
         async with session.post(
             f"{TG_API_BASE}/bot{BOT_TOKEN}/sendDocument",
@@ -107,6 +149,8 @@ async def _tg_send_document_file(
             timeout=aiohttp.ClientTimeout(total=60 * 60),
         ) as resp:
             return await resp.json()
+    finally:
+        f.close()
 
 
 async def _tg_delete_message(session: aiohttp.ClientSession, chat_id: int, message_id: int) -> dict:
@@ -584,17 +628,17 @@ async def _upload_local_path_to_tg(
     local_path: str, file_name: str, mime_type: str,
     dest_path: str, uploader_id: int,
 ) -> dict:
-    """本地 Bot API local mode: 从文件对象流式上传，不把文件整体读进内存。"""
+    """本地 Bot API local mode: 从文件对象流式单文件上传。"""
     size = os.path.getsize(local_path)
     if MAX_FILE_SIZE > 0 and size > MAX_FILE_SIZE * 1024 * 1024:
         raise ValueError(f"文件 {file_name} 超过 MAX_FILE_SIZE={MAX_FILE_SIZE}MB")
 
     file_type = guess_file_type(mime_type)
     async with aiohttp.ClientSession() as s:
-        cap = f"{dest_path} (local path)" if dest_path != "/" else "来自 TGDrive 的上传"
+        cap = f"{dest_path} (local stream)" if dest_path != "/" else "来自 TGDrive 的上传"
         res = await _tg_send_document_file(s, uploader_id, local_path, file_name, mime_type, cap)
     if not res.get("ok"):
-        raise RuntimeError(f"sendDocument(local path) 失败: {res.get('description', 'unknown')}")
+        raise RuntimeError(f"sendDocument(local stream) 失败: {res.get('description', 'unknown')}")
 
     msg = res["result"]
     doc = msg.get("document") or {}
@@ -624,6 +668,112 @@ async def _upload_local_path_to_tg(
             "file_name": file_name, "size": size, "path": dest_path}
 
 
+async def _upload_local_multipart_to_tg(
+    local_path: str, file_name: str, mime_type: str,
+    dest_path: str, uploader_id: int,
+    progress_cb: Optional[Callable[[int, int], None]] = None,
+) -> dict:
+    """本地 Bot API local mode: >1500MB 文件按 1500MB 分片，低内存上传。"""
+    size = os.path.getsize(local_path)
+    if MAX_FILE_SIZE > 0 and size > MAX_FILE_SIZE * 1024 * 1024:
+        raise ValueError(f"文件 {file_name} 超过 MAX_FILE_SIZE={MAX_FILE_SIZE}MB")
+
+    file_type = guess_file_type(mime_type)
+    chunk_count = (size + LOCAL_PART_SIZE - 1) // LOCAL_PART_SIZE
+    sha = hashlib.sha256()
+
+    from database import FileDB
+    db = await aiosqlite.connect(DB_PATH)
+    db.row_factory = aiosqlite.Row
+    try:
+        fdb = FileDB(db)
+        file_int_id = await fdb.add_multipart_file(
+            file_name=file_name, file_size=0, mime_type=mime_type,
+            file_type=file_type, path=dest_path, uploader_id=uploader_id,
+            chunk_count=chunk_count, total_sha256="",
+        )
+    finally:
+        await db.close()
+
+    total_done = 0
+    try:
+        async with aiohttp.ClientSession() as s:
+            for idx in range(chunk_count):
+                offset = idx * LOCAL_PART_SIZE
+                part_size = min(LOCAL_PART_SIZE, size - offset)
+                part_name = f"{file_name}.part{idx+1:04d}"
+                chunk_sha = hashlib.sha256()
+                # 只为校验计算流式 hash，不把分片读进内存。
+                with open(local_path, "rb") as f:
+                    f.seek(offset)
+                    remaining = part_size
+                    while remaining > 0:
+                        data = f.read(min(1024 * 1024, remaining))
+                        if not data:
+                            break
+                        chunk_sha.update(data)
+                        sha.update(data)
+                        remaining -= len(data)
+                chunk_hex = chunk_sha.hexdigest()
+                cap = (f"【分片 {idx+1}/{chunk_count}】{file_name}\n"
+                       f"file_int_id={file_int_id} sha={chunk_hex[:12]}")
+                res = await _tg_send_document_file(
+                    s, uploader_id, local_path, part_name, "application/octet-stream",
+                    cap, offset=offset, size=part_size,
+                )
+                if not res.get("ok"):
+                    raise RuntimeError(f"sendDocument(local part {idx+1}) 失败: {res.get('description', 'unknown')}")
+                msg = res["result"]
+                doc = msg.get("document", {})
+                db2 = await aiosqlite.connect(DB_PATH)
+                db2.row_factory = aiosqlite.Row
+                try:
+                    fdb2 = FileDB(db2)
+                    await fdb2.add_chunk(
+                        file_id_int=file_int_id, chunk_index=idx,
+                        tg_file_id=doc.get("file_id", ""),
+                        tg_file_unique_id=doc.get("file_unique_id", ""),
+                        chunk_size=part_size,
+                        chunk_sha256=chunk_hex,
+                        message_id=msg.get("message_id", 0),
+                        chat_id=msg.get("chat", {}).get("id", 0),
+                    )
+                    if idx == 0:
+                        await db2.execute(
+                            "UPDATE files SET file_id=?, file_unique_id=?, message_id=?, chat_id=? WHERE id=?",
+                            (doc.get("file_id", ""), doc.get("file_unique_id", ""),
+                             msg.get("message_id", 0), msg.get("chat", {}).get("id", 0), file_int_id),
+                        )
+                        await db2.commit()
+                finally:
+                    await db2.close()
+                total_done += part_size
+                if progress_cb:
+                    progress_cb(total_done, size)
+
+        db3 = await aiosqlite.connect(DB_PATH)
+        try:
+            await db3.execute(
+                "UPDATE files SET file_size=?, chunk_count=?, total_sha256=? WHERE id=?",
+                (size, chunk_count, sha.hexdigest(), file_int_id),
+            )
+            await db3.commit()
+        finally:
+            await db3.close()
+    except Exception:
+        db4 = await aiosqlite.connect(DB_PATH)
+        try:
+            await db4.execute("UPDATE files SET deleted=1 WHERE id=?", (file_int_id,))
+            await db4.commit()
+        finally:
+            await db4.close()
+        raise
+
+    return {"ok": True, "mode": "local_multipart", "file_id": file_int_id,
+            "file_name": file_name, "size": size, "path": dest_path,
+            "chunk_count": chunk_count, "sha256": sha.hexdigest()}
+
+
 # ---------- 兼容入口：从本地文件上传（webdav / 旧 webui 调用） ----------
 
 async def upload_local_file_to_tg(
@@ -648,12 +798,16 @@ async def upload_local_file_to_tg(
     if LOCAL_API_BASE and LOCAL_API_MODE:
         if progress_cb:
             progress_cb(0, size)
-        result = await _upload_local_path_to_tg(
-            local_path, file_name, mime_type, dest_path, uploader_id
+        if size <= LOCAL_SINGLE_UPLOAD_LIMIT:
+            result = await _upload_local_path_to_tg(
+                local_path, file_name, mime_type, dest_path, uploader_id
+            )
+            if progress_cb:
+                progress_cb(size, size)
+            return result
+        return await _upload_local_multipart_to_tg(
+            local_path, file_name, mime_type, dest_path, uploader_id, progress_cb=progress_cb
         )
-        if progress_cb:
-            progress_cb(size, size)
-        return result
 
     # 把同步文件改成 async reader
     f = open(local_path, "rb")

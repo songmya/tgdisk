@@ -28,9 +28,11 @@ services:
 
       # 启用 LOCAL_API_MODE 后，本地缓存文件走低内存文件流上传，
       # 不需要把分片阈值调很大。
-      TG_UPLOAD_CHUNK_SIZE_MB: "18"
-      TG_SINGLE_UPLOAD_THRESHOLD_MB: "18"
-      UPLOAD_CONCURRENCY: "2"
+      TG_UPLOAD_CHUNK_SIZE_MB: "1500"
+      TG_SINGLE_UPLOAD_THRESHOLD_MB: "1500"
+      TG_LOCAL_SINGLE_UPLOAD_LIMIT_MB: "1500"
+      TG_LOCAL_PART_SIZE_MB: "1500"
+      UPLOAD_CONCURRENCY: "1"
 
       UPLOAD_CACHE_ENABLED: "true"
       UPLOAD_CACHE_DIR: "data/cache"

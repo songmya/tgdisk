@@ -296,11 +296,27 @@ class TelegramFolder(DAVCollection):
         self.db_path = db_path  # 网盘内的逻辑路径
         
     def support_recursive_delete(self):
-        return False
+        return True
 
     def delete(self):
-        # 目录本身没有 deleted 标记；暂不支持 WebDAV 删除目录，避免误删整棵树。
-        raise DAVError(HTTP_FORBIDDEN, "目录删除暂不支持；文件删除会进入回收站")
+        """WebDAV 删除目录：递归删除目录记录，目录内文件进入回收站。"""
+        if self.db_path == "/":
+            raise DAVError(HTTP_FORBIDDEN, "根目录不能删除")
+
+        async def do_delete_dir():
+            db = await aiosqlite.connect(DB_PATH)
+            db.row_factory = aiosqlite.Row
+            try:
+                dir_db = DirDB(db)
+                files, dirs = await dir_db.delete_dir_recursive(self.db_path, deleted_by="webdav")
+                if dirs == 0:
+                    raise DAVError(HTTP_CONFLICT, "目录不存在")
+                return files, dirs
+            finally:
+                await db.close()
+
+        files, dirs = run_async(do_delete_dir())
+        logger.info("WebDAV delete dir: %s (files=%s dirs=%s)", self.db_path, files, dirs)
 
     def create_collection(self, name):
         """WebDAV MKCOL：在当前目录下创建子目录。"""

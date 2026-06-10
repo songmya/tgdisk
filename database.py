@@ -376,6 +376,29 @@ class DirDB:
         )
         return await cursor.fetchone() is not None
 
+    async def delete_dir_recursive(self, path: str, deleted_by: str = "webdav") -> tuple[int, int]:
+        """递归删除目录记录，并把目录内文件移入回收站。返回(文件数,目录数)。"""
+        path = path.rstrip("/") or "/"
+        if path == "/":
+            raise ValueError("根目录不能删除")
+        if not await self.dir_exists(path):
+            return (0, 0)
+        like = path + "/%"
+        cursor = await self.db.execute(
+            """UPDATE files
+               SET deleted=1, deleted_at=datetime('now','localtime'), deleted_by=?
+               WHERE deleted=0 AND (path=? OR path LIKE ?)""",
+            (deleted_by, path, like),
+        )
+        file_count = cursor.rowcount if cursor.rowcount is not None else 0
+        cursor = await self.db.execute(
+            "DELETE FROM dirs WHERE path=? OR path LIKE ?",
+            (path, like),
+        )
+        dir_count = cursor.rowcount if cursor.rowcount is not None else 0
+        await self.db.commit()
+        return (file_count, dir_count)
+
 
 class UserDB:
     """用户数据库操作"""
