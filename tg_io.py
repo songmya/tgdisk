@@ -14,7 +14,7 @@ from typing import AsyncIterator, Awaitable, Callable, Optional
 import aiohttp
 import aiosqlite
 
-from config import BOT_TOKEN, PROXY, ADMIN_IDS, DB_PATH, MAX_FILE_SIZE, LOCAL_API_BASE
+from config import BOT_TOKEN, PROXY, ADMIN_IDS, DB_PATH, MAX_FILE_SIZE, LOCAL_API_BASE, LOCAL_API_MODE
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +38,18 @@ SINGLE_UPLOAD_THRESHOLD = _env_size_mb(
 TG_API_BASE = (LOCAL_API_BASE or "https://api.telegram.org").rstrip("/")
 TG_FILE_BASE = TG_API_BASE.replace("/bot", "").rstrip("/")
 
+
+def _tg_proxy() -> Optional[str]:
+    """Telegram Bot API 请求使用的代理。
+
+    当 TG_API_BASE 指向自建/本地 Bot API Server 时，bot 程序只需要访问这个
+    Bot API Server，本身不应再套 HTTP 代理；否则 127.0.0.1 / LAN 地址可能被
+    代理转发导致上传大文件时 Broken pipe / Connection lost。
+    """
+    if LOCAL_API_BASE:
+        return None
+    return PROXY or None
+
 # 并发参数
 UPLOAD_CONCURRENCY = int(os.getenv("UPLOAD_CONCURRENCY", "4"))
 UPLOAD_RETRY = 3
@@ -55,7 +67,7 @@ async def _tg_send_document(
     caption: str = "",
 ) -> dict:
     """sendDocument。返回原始 JSON。"""
-    proxy = PROXY or None
+    proxy = _tg_proxy()
     form = aiohttp.FormData()
     form.add_field("chat_id", str(chat_id))
     form.add_field("document", data, filename=filename, content_type=mime_type)
@@ -69,9 +81,37 @@ async def _tg_send_document(
         return await resp.json()
 
 
+async def _tg_send_document_file(
+    session: aiohttp.ClientSession,
+    chat_id: int,
+    local_path: str,
+    filename: str,
+    mime_type: str,
+    caption: str = "",
+) -> dict:
+    """sendDocument(local mode): 从本地文件对象流式上传。
+
+    telegram-bot-api 的 HTTP JSON 参数不会把 /path 当作本地文件路径；它会按
+    URL/file_id 解析。这里改用 multipart + file object，aiohttp 会从磁盘分块
+    读取并发送给本地 Bot API，避免把大文件整体读进 Python 内存。
+    """
+    form = aiohttp.FormData()
+    form.add_field("chat_id", str(chat_id))
+    if caption:
+        form.add_field("caption", caption)
+    with open(local_path, "rb") as f:
+        form.add_field("document", f, filename=filename, content_type=mime_type)
+        async with session.post(
+            f"{TG_API_BASE}/bot{BOT_TOKEN}/sendDocument",
+            data=form, proxy=_tg_proxy(),
+            timeout=aiohttp.ClientTimeout(total=60 * 60),
+        ) as resp:
+            return await resp.json()
+
+
 async def _tg_delete_message(session: aiohttp.ClientSession, chat_id: int, message_id: int) -> dict:
     """deleteMessage。注意：Telegram 可能因为时间限制/权限限制拒绝删除。"""
-    proxy = PROXY or None
+    proxy = _tg_proxy()
     async with session.post(
         f"{TG_API_BASE}/bot{BOT_TOKEN}/deleteMessage",
         json={"chat_id": chat_id, "message_id": message_id},
@@ -151,7 +191,7 @@ async def delete_tg_messages_for_file(file_id_int: int) -> dict:
 
 
 async def _tg_get_file_url(session: aiohttp.ClientSession, file_id: str) -> Optional[str]:
-    proxy = PROXY or None
+    proxy = _tg_proxy()
     async with session.post(
         f"{TG_API_BASE}/bot{BOT_TOKEN}/getFile",
         json={"file_id": file_id}, proxy=proxy,
@@ -247,6 +287,54 @@ async def _upload_single_bytes(
             "file_name": file_name, "size": len(payload), "path": dest_path}
 
 
+# ---------- 覆盖清理 ----------
+
+async def delete_file_and_messages(file_id_int: int) -> tuple[bool, list[str]]:
+    """尽力删除 Telegram 消息，并彻底删除本地索引。
+
+    Telegram Bot API 可能因时间或权限限制拒绝删除旧消息；覆盖语义以本地索引
+    为准，所以这里记录警告但不因为消息删除失败而阻止新文件覆盖。
+    """
+    tg_result = await delete_tg_messages_for_file(file_id_int)
+    if not tg_result.get("ok"):
+        logger.warning(
+            "Telegram message cleanup failed for file %s during overwrite: %s",
+            file_id_int,
+            tg_result.get("errors", []),
+        )
+
+    from database import FileDB
+    db = await aiosqlite.connect(DB_PATH)
+    db.row_factory = aiosqlite.Row
+    try:
+        ok = await FileDB(db).delete_index(file_id_int)
+    finally:
+        await db.close()
+    return ok, []
+
+
+async def delete_files_by_path_name(path: str, file_name: str) -> tuple[int, list[str]]:
+    """删除同目录同名的所有未删除文件，用于 WebDAV 覆盖上传。"""
+    from database import FileDB
+    db = await aiosqlite.connect(DB_PATH)
+    db.row_factory = aiosqlite.Row
+    try:
+        existing_files = await FileDB(db).find_all_by_path_name(path, file_name)
+    finally:
+        await db.close()
+
+    errors: list[str] = []
+    deleted = 0
+    for existing in existing_files:
+        ok, file_errors = await delete_file_and_messages(int(existing["id"]))
+        if ok:
+            deleted += 1
+        errors.extend(file_errors)
+    if errors:
+        raise RuntimeError("同名文件覆盖失败，删除旧文件失败：" + "; ".join(errors))
+    return deleted, []
+
+
 # ---------- 流式切片上传 ----------
 
 async def upload_stream_to_tg(
@@ -256,15 +344,21 @@ async def upload_stream_to_tg(
     dest_path: str,
     uploader_id: Optional[int] = None,
     progress_cb: Optional[Callable[[int], None]] = None,
+    overwrite: bool = False,
 ) -> dict:
     """从一个 async reader(n)->bytes 来源流式读取，自动判断单传 vs 切片。
 
     单传路径: 第一片读到 <= SINGLE_UPLOAD_THRESHOLD 时，整体 sendDocument。
     切片路径: 每读满 CHUNK_SIZE 立刻丢给后台 worker 上传。
               切片是并发上传（UPLOAD_CONCURRENCY 路），后台失败会标记失败，主流程结束抛错。
+    overwrite=True 时，会在上传前清理同目录同名的旧 Telegram 消息和索引，
+    让 WebDAV PUT 同名文件表现为直接覆盖。
     """
     if uploader_id is None:
         uploader_id = ADMIN_IDS[0]
+
+    if overwrite:
+        await delete_files_by_path_name(dest_path, file_name)
 
     # 先尝试凑足 SINGLE_UPLOAD_THRESHOLD+1 字节来判断走单传还是切片
     first = b""
@@ -448,15 +542,82 @@ async def upload_stream_to_tg(
     }
 
 
+# ---------- local Bot API 低内存文件流上传 ----------
+
+async def _upload_local_path_to_tg(
+    local_path: str, file_name: str, mime_type: str,
+    dest_path: str, uploader_id: int,
+) -> dict:
+    """本地 Bot API local mode: 从文件对象流式上传，不把文件整体读进内存。"""
+    size = os.path.getsize(local_path)
+    if MAX_FILE_SIZE > 0 and size > MAX_FILE_SIZE * 1024 * 1024:
+        raise ValueError(f"文件 {file_name} 超过 MAX_FILE_SIZE={MAX_FILE_SIZE}MB")
+
+    file_type = guess_file_type(mime_type)
+    async with aiohttp.ClientSession() as s:
+        cap = f"{dest_path} (local path)" if dest_path != "/" else "来自 TGDrive 的上传"
+        res = await _tg_send_document_file(s, uploader_id, local_path, file_name, mime_type, cap)
+    if not res.get("ok"):
+        raise RuntimeError(f"sendDocument(local path) 失败: {res.get('description', 'unknown')}")
+
+    msg = res["result"]
+    doc = msg.get("document") or {}
+    if not doc.get("file_id"):
+        raise RuntimeError("Telegram 未返回 document 对象")
+
+    from database import FileDB
+    db = await aiosqlite.connect(DB_PATH)
+    db.row_factory = aiosqlite.Row
+    try:
+        fdb = FileDB(db)
+        row_id = await fdb.add_file(
+            file_id=doc["file_id"],
+            file_unique_id=doc.get("file_unique_id", ""),
+            file_name=file_name,
+            file_size=doc.get("file_size") or size,
+            mime_type=mime_type,
+            file_type=file_type,
+            path=dest_path,
+            uploader_id=uploader_id,
+            message_id=msg.get("message_id", 0),
+            chat_id=msg.get("chat", {}).get("id", 0),
+        )
+    finally:
+        await db.close()
+    return {"ok": True, "mode": "local_stream", "file_id": row_id,
+            "file_name": file_name, "size": size, "path": dest_path}
+
+
 # ---------- 兼容入口：从本地文件上传（webdav / 旧 webui 调用） ----------
 
 async def upload_local_file_to_tg(
     local_path: str, file_name: str, mime_type: str,
     dest_path: str, uploader_id: Optional[int] = None,
     progress_cb: Optional[Callable[[int, int], None]] = None,
+    overwrite: bool = False,
 ) -> dict:
-    """从本地文件上传，封装成调用 upload_stream_to_tg。"""
+    """从本地文件上传。
+
+    LOCAL_API_MODE=true 且配置 LOCAL_API_BASE 时，优先用本地文件对象流式
+    上传，避免 Python 进程按大分片把文件读入内存。否则回退到兼容的
+    流式切片上传。
+    """
     size = os.path.getsize(local_path)
+    if uploader_id is None:
+        uploader_id = ADMIN_IDS[0]
+
+    if overwrite:
+        await delete_files_by_path_name(dest_path, file_name)
+
+    if LOCAL_API_BASE and LOCAL_API_MODE:
+        if progress_cb:
+            progress_cb(0, size)
+        result = await _upload_local_path_to_tg(
+            local_path, file_name, mime_type, dest_path, uploader_id
+        )
+        if progress_cb:
+            progress_cb(size, size)
+        return result
 
     # 把同步文件改成 async reader
     f = open(local_path, "rb")
@@ -475,6 +636,7 @@ async def upload_local_file_to_tg(
             reader=reader, file_name=file_name, mime_type=mime_type,
             dest_path=dest_path, uploader_id=uploader_id,
             progress_cb=cb_inner,
+            overwrite=False,
         )
     finally:
         f.close()
@@ -573,7 +735,7 @@ async def stream_file_by_id(
         return
 
     # 计算每个分片在整体文件中的偏移区间
-    proxy = PROXY or None
+    proxy = _tg_proxy()
     offset = 0
     async with aiohttp.ClientSession() as s:
         for c in chunks:

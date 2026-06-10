@@ -148,6 +148,16 @@ class FileDB:
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
+    async def find_all_by_path_name(self, path: str, file_name: str) -> list[dict]:
+        """查找同目录同名的所有未删除文件记录。"""
+        cursor = await self.db.execute(
+            """SELECT * FROM files WHERE path = ? AND file_name = ? AND deleted = 0
+               ORDER BY id DESC""",
+            (path, file_name),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
     async def count_files(self, path: str = "/") -> int:
         """统计目录下文件数"""
         cursor = await self.db.execute(
@@ -193,6 +203,14 @@ class FileDB:
         """从数据库中彻底删除索引；Telegram 服务器上的文件无法保证删除。"""
         cursor = await self.db.execute(
             "DELETE FROM files WHERE id = ? AND deleted = 1", (file_id_int,)
+        )
+        await self.db.commit()
+        return cursor.rowcount > 0
+
+    async def delete_index(self, file_id_int: int) -> bool:
+        """彻底删除文件索引，不要求文件已在回收站。"""
+        cursor = await self.db.execute(
+            "DELETE FROM files WHERE id = ?", (file_id_int,)
         )
         await self.db.commit()
         return cursor.rowcount > 0

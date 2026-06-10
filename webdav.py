@@ -114,6 +114,7 @@ class TelegramFile(DAVNonCollection):
     def __init__(self, path, environ, file_info):
         super().__init__(path, environ)
         self.file_info = file_info
+        self._writer: Optional[_StreamingWriter] = None
 
     def get_content_length(self):
         return self.file_info["file_size"]
@@ -162,6 +163,35 @@ class TelegramFile(DAVNonCollection):
                     bool(self.file_info.get("is_multipart")), lo, hi)
         return _TGStreamReader(self.file_info["id"], range_start=lo, range_end=hi)
 
+    def begin_write(self, content_type=None):
+        """WebDAV PUT 到已有文件时，直接覆盖同名旧文件。"""
+        import mimetypes
+        mime, _ = mimetypes.guess_type(self.file_info["file_name"])
+        mime = mime or content_type or "application/octet-stream"
+        self._writer = _StreamingWriter(
+            self.file_info["file_name"],
+            mime,
+            self.file_info["path"],
+            overwrite=True,
+        )
+        return self._writer
+
+    def end_write(self, with_errors):
+        if not self._writer:
+            return
+        if with_errors:
+            logger.warning("WebDAV overwrite aborted by client: %s", self.file_info["file_name"])
+            try:
+                self._writer.close()
+            except Exception:
+                pass
+            return
+        try:
+            self._writer.close()
+        except Exception as e:
+            logger.error("WebDAV overwrite end_write error: %s", e)
+            raise
+
     def delete(self):
         """WebDAV 删除进入回收站，而不是彻底删除索引。"""
         from database import FileDB
@@ -180,23 +210,23 @@ class TelegramFile(DAVNonCollection):
 
 
 class _StreamingWriter:
-    """同步 file-like：WebDAV 客户端 write()、close() 会被调用。
+    """同步 file-like：WebDAV PUT 先落临时文件，再交给 tg_io 上传。
 
-    背后起一个后台线程跑 async upload_stream_to_tg，读端从 queue 取数据。
+    在 LOCAL_API_MODE=true 时，upload_local_file_to_tg 会把临时文件路径直接交给
+    本地 Bot API Server，避免把大文件按分片读进 Python 内存。
     """
 
-    def __init__(self, file_name: str, mime_type: str, dest_path: str):
-        import queue, threading
+    def __init__(self, file_name: str, mime_type: str, dest_path: str, overwrite: bool = False):
         self.file_name = file_name
         self.mime_type = mime_type
         self.dest_path = dest_path
-        self._q: "queue.Queue[bytes | None]" = queue.Queue(maxsize=8)
-        self._buf = b""
-        self._result = None
+        self.overwrite = overwrite
         self._error = None
         self._closed = False
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
+        suffix = os.path.splitext(file_name)[1] or ".upload"
+        tmp = tempfile.NamedTemporaryFile(prefix="tgdisk-webdav-", suffix=suffix, delete=False)
+        self._tmp_path = tmp.name
+        self._file = tmp
 
     # ---- WebDAV 会调用的同步接口 ----
     def write(self, data: bytes):
@@ -204,46 +234,37 @@ class _StreamingWriter:
             raise self._error
         if not data:
             return
-        self._q.put(bytes(data))
+        self._file.write(data)
 
     def close(self):
         if self._closed:
             return
         self._closed = True
-        self._q.put(None)  # EOF
-        self._thread.join()
-        if self._error:
-            raise self._error
-
-    # ---- 后台 ----
-    def _run(self):
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-        async def reader(n: int) -> bytes:
-            # 返回 ≤ n 字节；不够就从 queue 拉
-            if not self._buf:
-                item = await loop.run_in_executor(None, self._q.get)
-                if item is None:
-                    return b""
-                self._buf = item
-            out, self._buf = self._buf[:n], self._buf[n:]
-            return out
-
         try:
-            self._result = loop.run_until_complete(upload_stream_to_tg(
-                reader=reader, file_name=self.file_name,
-                mime_type=self.mime_type, dest_path=self.dest_path,
+            self._file.flush()
+            self._file.close()
+            self._result = run_async(upload_local_file_to_tg(
+                local_path=self._tmp_path,
+                file_name=self.file_name,
+                mime_type=self.mime_type,
+                dest_path=self.dest_path,
                 uploader_id=ADMIN_IDS[0],
+                overwrite=self.overwrite,
             ))
-            logger.info("WebDAV streaming upload done: %s mode=%s size=%s",
+            logger.info("WebDAV temp-file upload done: %s mode=%s size=%s",
                         self.file_name, self._result.get("mode"),
                         self._result.get("size"))
         except Exception as e:
             self._error = e
-            logger.error("WebDAV streaming upload failed: %s", e)
+            logger.error("WebDAV temp-file upload failed: %s", e)
+            raise
         finally:
-            loop.close()
+            try:
+                os.unlink(self._tmp_path)
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                logger.warning("WebDAV temp cleanup failed %s: %s", self._tmp_path, e)
 
 class TelegramFolder(DAVCollection):
     def __init__(self, path, environ, db_path):
@@ -438,7 +459,7 @@ class TempUploadFile(DAVNonCollection):
         import mimetypes
         mime, _ = mimetypes.guess_type(self.file_name)
         mime = mime or content_type or "application/octet-stream"
-        self._writer = _StreamingWriter(self.file_name, mime, self.db_path)
+        self._writer = _StreamingWriter(self.file_name, mime, self.db_path, overwrite=True)
         return self._writer
 
     def end_write(self, with_errors):
