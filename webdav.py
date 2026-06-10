@@ -16,31 +16,50 @@ import tempfile
 from io import BytesIO
 from typing import Optional
 from wsgidav.dav_provider import DAVProvider, DAVCollection, DAVNonCollection
-from wsgidav.dav_error import DAVError, HTTP_FORBIDDEN, HTTP_CONFLICT
+from wsgidav.dav_error import DAVError, HTTP_FORBIDDEN, HTTP_CONFLICT, HTTP_NOT_FOUND
 from wsgidav.wsgidav_app import WsgiDAVApp
 from cheroot import wsgi
 
-import config
-from config import DB_PATH, BOT_TOKEN, PROXY, ADMIN_IDS
+from config import DB_PATH, ADMIN_IDS, WEBDAV_USERNAME, WEBDAV_PASSWORD
 from database import FileDB, DirDB
-from tg_io import upload_local_file_to_tg, upload_stream_to_tg, stream_file_by_id
+from tg_io import upload_local_file_to_tg, stream_file_by_id
 from utils import normalize_path
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("webdav")
 
 
-def run_async(coro):
-    """在当前线程跑一个 coroutine。为了跟 wsgidav（同步）打交道。"""
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            # 被别人占着了 -- 新起一个
-            raise RuntimeError
-    except RuntimeError:
+_ASYNC_LOOP: Optional[asyncio.AbstractEventLoop] = None
+_ASYNC_LOOP_THREAD: Optional[threading.Thread] = None
+_ASYNC_LOOP_LOCK = threading.Lock()
+
+
+def _ensure_async_loop() -> asyncio.AbstractEventLoop:
+    """Return a shared background loop for WsgiDAV sync callbacks.
+
+    Creating ad-hoc event loops per request leaks selectors/file descriptors over long runs.
+    """
+    global _ASYNC_LOOP, _ASYNC_LOOP_THREAD
+    with _ASYNC_LOOP_LOCK:
+        if _ASYNC_LOOP and _ASYNC_LOOP.is_running():
+            return _ASYNC_LOOP
         loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-    return loop.run_until_complete(coro)
+
+        def runner():
+            asyncio.set_event_loop(loop)
+            loop.run_forever()
+
+        thread = threading.Thread(target=runner, name="tgdisk-webdav-async", daemon=True)
+        thread.start()
+        _ASYNC_LOOP = loop
+        _ASYNC_LOOP_THREAD = thread
+        return loop
+
+
+def run_async(coro):
+    """Run a coroutine from WsgiDAV's synchronous callbacks on a shared loop."""
+    future = asyncio.run_coroutine_threadsafe(coro, _ensure_async_loop())
+    return future.result()
 
 
 class _TGStreamReader(io.RawIOBase):
@@ -226,7 +245,7 @@ class TelegramFile(DAVNonCollection):
                 fdb = FileDB(db)
                 ok = await fdb.delete_file(self.file_info["id"], deleted_by="webdav")
                 if not ok:
-                    raise RuntimeError("文件不存在或已删除")
+                    raise DAVError(HTTP_NOT_FOUND, "文件不存在或已删除")
             finally:
                 await db.close()
         logger.info("WebDAV move to trash: %s (id=%s)", self.file_info["file_name"], self.file_info["id"])
@@ -248,7 +267,9 @@ class _StreamingWriter:
         self._error = None
         self._closed = False
         suffix = os.path.splitext(file_name)[1] or ".upload"
-        tmp = tempfile.NamedTemporaryFile(prefix="tgdisk-webdav-", suffix=suffix, delete=False)
+        tmp_dir = os.getenv("UPLOAD_CACHE_DIR", "data/cache")
+        os.makedirs(tmp_dir, exist_ok=True)
+        tmp = tempfile.NamedTemporaryFile(prefix="tgdisk-webdav-", suffix=suffix, dir=tmp_dir, delete=False)
         self._tmp_path = tmp.name
         self._file = tmp
 
@@ -283,12 +304,18 @@ class _StreamingWriter:
             logger.error("WebDAV temp-file upload failed: %s", e)
             raise
         finally:
-            try:
-                os.unlink(self._tmp_path)
-            except FileNotFoundError:
-                pass
-            except Exception as e:
-                logger.warning("WebDAV temp cleanup failed %s: %s", self._tmp_path, e)
+            if self._error:
+                logger.warning(
+                    "WebDAV temp file kept for possible resume after failed upload: %s",
+                    self._tmp_path,
+                )
+            else:
+                try:
+                    os.unlink(self._tmp_path)
+                except FileNotFoundError:
+                    pass
+                except Exception as e:
+                    logger.warning("WebDAV temp cleanup failed %s: %s", self._tmp_path, e)
 
 class TelegramFolder(DAVCollection):
     def __init__(self, path, environ, db_path):
@@ -539,14 +566,23 @@ def create_webdav_app() -> WsgiDAVApp:
     可被 webui.py 通过 FastAPI/Starlette 的 WSGIMiddleware 挂载到
     同一个 HTTP 端口（默认路径 /dav），也可继续由本文件独立启动。
     """
+    user_mapping = {"*": True}
+    if WEBDAV_USERNAME and WEBDAV_PASSWORD:
+        user_mapping = {"*": {WEBDAV_USERNAME: {"password": WEBDAV_PASSWORD}}}
+    else:
+        logger.warning("WebDAV is running without authentication; set WEBDAV_USERNAME/WEBDAV_PASSWORD in production")
+
     config = {
         "provider_mapping": {
             "/": TGDriveProvider(),
         },
         "simple_dc": {
-            "user_mapping": {
-                "*": True  # 允许匿名访问，为了安全可以加账号密码
-            }
+            "user_mapping": user_mapping,
+        },
+        "http_authenticator": {
+            "accept_basic": True,
+            "accept_digest": True,
+            "default_to_digest": False,
         },
         "logging": {
             "enable": True,

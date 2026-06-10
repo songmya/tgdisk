@@ -723,13 +723,8 @@ async def upload_stream_to_tg(
             await db.close()
         raise
 
-    if failures:
-        # 标记主记录"上传未完成"；保留分片信息以便断点续传（不删 deleted=0）
-        raise RuntimeError(
-            f"{len(failures)} 个分片上传失败；可调用 /api/resume-upload/{file_int_id} 续传")
-
     chunk_count = chunk_index
-    # 更新主记录的总大小、分片数、整体 sha256
+    # 无论是否有失败分片，都先写入总大小/分片数，确保续传接口能正确计算 missing。
     db = await aiosqlite.connect(DB_PATH)
     try:
         await db.execute(
@@ -738,6 +733,11 @@ async def upload_stream_to_tg(
         await db.commit()
     finally:
         await db.close()
+
+    if failures:
+        # 保留主记录和分片状态以便断点续传。
+        raise RuntimeError(
+            f"{len(failures)} 个分片上传失败；可调用 /api/resume-upload/{file_int_id} 续传")
 
     return {
         "ok": True, "mode": "multipart", "file_id": file_int_id,
@@ -1091,6 +1091,14 @@ async def stream_file_by_id(
                 "WHERE file_id_int=? AND status='ok' "
                 "ORDER BY chunk_index ASC", (file_id_int,))
             chunks = [dict(r) for r in await cursor.fetchall()]
+            total_chunks = int(f.get("chunk_count") or 0)
+            present = {int(c["chunk_index"]) for c in chunks}
+            missing = [i for i in range(total_chunks) if i not in present]
+            if total_chunks <= 0 or missing:
+                raise RuntimeError(
+                    f"multipart 文件分片不完整: file_id={file_id_int}, "
+                    f"ok={len(present)}/{total_chunks}, missing={missing[:20]}"
+                )
         else:
             chunks = [{"chunk_index": 0, "tg_file_id": f["file_id"],
                        "chunk_size": f["file_size"]}]

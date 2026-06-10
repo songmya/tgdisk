@@ -38,6 +38,17 @@ PAGE_SIZE = int(os.getenv("PAGE_SIZE", "20"))
 # 日志
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
+# Web/API 安全。WEBUI_TOKEN 为空时保持旧行为（不鉴权），但生产环境强烈建议设置。
+WEBUI_TOKEN = os.getenv("WEBUI_TOKEN", "")
+CORS_ALLOW_ORIGINS = [x.strip() for x in os.getenv("CORS_ALLOW_ORIGINS", "").split(",") if x.strip()]
+
+# 断点续传 source_path 白名单；为空时默认仅允许 UPLOAD_CACHE_DIR 和系统临时目录。
+RESUME_ALLOWED_DIRS = [x.strip() for x in os.getenv("RESUME_ALLOWED_DIRS", "").split(",") if x.strip()]
+
+# WebDAV Basic Auth；为空时保持旧行为（匿名）。生产环境建议设置。
+WEBDAV_USERNAME = os.getenv("WEBDAV_USERNAME", "")
+WEBDAV_PASSWORD = os.getenv("WEBDAV_PASSWORD", "")
+
 
 def validate():
     """校验必要配置"""

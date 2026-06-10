@@ -38,6 +38,9 @@ services:
       UPLOAD_CACHE_DIR: "data/cache"
       UPLOAD_CACHE_KEEP_AFTER_DONE: "false"
 
+      # 允许 /api/resume-upload 从 WebUI 缓存、系统临时目录、Bot API local 共享目录读取源文件。
+      RESUME_ALLOWED_DIRS: "/app/data/cache,/tmp,/var/lib/telegram-bot-api"
+
     volumes:
       # tgdisk 数据库、WebUI 上传缓存等
       - ./data:/app/data

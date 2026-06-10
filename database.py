@@ -311,12 +311,40 @@ class FileDB:
         row = await cursor.fetchone()
         if not row:
             return []
-        total = row[0]
+        total = int(row[0] or 0)
+        if total <= 0:
+            # 旧失败记录可能还没写入 chunk_count；用已有 chunk 的最大索引兜底，
+            # 避免续传接口误判为 already_complete。
+            cursor = await self.db.execute(
+                "SELECT COALESCE(MAX(chunk_index) + 1, 0) FROM file_chunks WHERE file_id_int=?",
+                (file_id_int,))
+            total = int((await cursor.fetchone())[0] or 0)
         cursor = await self.db.execute(
             "SELECT chunk_index FROM file_chunks WHERE file_id_int=? AND status='ok'",
             (file_id_int,))
         present = {r[0] for r in await cursor.fetchall()}
         return [i for i in range(total) if i not in present]
+
+    async def multipart_integrity(self, file_id_int: int) -> dict:
+        """返回 multipart 完整性信息，下载前用于避免缺片静默损坏。"""
+        cursor = await self.db.execute(
+            "SELECT id, is_multipart, chunk_count FROM files WHERE id=? AND deleted=0",
+            (file_id_int,))
+        f = await cursor.fetchone()
+        if not f:
+            return {"exists": False, "complete": False, "missing": []}
+        if not f["is_multipart"]:
+            return {"exists": True, "multipart": False, "complete": True, "missing": []}
+        total = int(f["chunk_count"] or 0)
+        cursor = await self.db.execute(
+            "SELECT chunk_index FROM file_chunks WHERE file_id_int=? AND status='ok'",
+            (file_id_int,))
+        present = {int(r[0]) for r in await cursor.fetchall()}
+        missing = [i for i in range(total) if i not in present]
+        return {
+            "exists": True, "multipart": True, "complete": total > 0 and not missing,
+            "chunk_count": total, "ok_count": len(present), "missing": missing,
+        }
 
     async def mark_chunk_status(self, file_id_int: int, chunk_index: int, status: str):
         await self.db.execute(

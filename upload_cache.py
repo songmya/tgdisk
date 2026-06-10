@@ -11,9 +11,9 @@ from pathlib import Path
 from typing import Optional
 
 import aiosqlite
-from fastapi import HTTPException, UploadFile, Request
+from fastapi import HTTPException, UploadFile
 
-from config import DB_PATH, ADMIN_IDS
+from config import DB_PATH, ADMIN_IDS, MAX_FILE_SIZE
 from tg_io import upload_local_file_to_tg, CHUNK_SIZE
 
 UPLOAD_CACHE_ENABLED = os.getenv("UPLOAD_CACHE_ENABLED", "true").lower() in ("1", "true", "yes", "on")
@@ -280,11 +280,23 @@ async def list_upload_sessions(limit: int = 50) -> list[dict]:
     await init_table_only()
     db = await _db()
     try:
-        cursor = await db.execute("SELECT id FROM upload_sessions ORDER BY created_at DESC LIMIT ?", (limit,))
-        ids = [row["id"] for row in await cursor.fetchall()]
+        cursor = await db.execute("SELECT * FROM upload_sessions ORDER BY created_at DESC LIMIT ?", (limit,))
+        rows = [dict(r) for r in await cursor.fetchall()]
     finally:
         await db.close()
-    return [await get_upload_session(i) for i in ids]
+    out = []
+    for data in rows:
+        if data.get("result_json"):
+            try:
+                data["result"] = json.loads(data["result_json"])
+            except Exception:
+                data["result"] = None
+        else:
+            data["result"] = None
+        data["server_progress"] = (data["received_size"] / data["total_size"] * 100) if data["total_size"] else 0
+        data["telegram_progress"] = (data["telegram_read_bytes"] / data["telegram_total_bytes"] * 100) if data["telegram_total_bytes"] else 0
+        out.append(data)
+    return out
 
 
 async def write_upload_chunk(session_id: str, offset: int, data: bytes) -> dict:
@@ -300,8 +312,12 @@ async def write_upload_chunk(session_id: str, offset: int, data: bytes) -> dict:
     end = offset + len(data)
     if total_size and end > total_size:
         raise HTTPException(416, "分片超出文件总大小")
+    if len(data) > BROWSER_CHUNK_SIZE * 2:
+        raise HTTPException(413, f"单个分片过大，请控制在 {BROWSER_CHUNK_SIZE} 字节左右")
     if UPLOAD_CACHE_MAX_FILE_SIZE_MB > 0 and end > UPLOAD_CACHE_MAX_FILE_SIZE_MB * 1024 * 1024:
         raise HTTPException(413, f"文件超过 UPLOAD_CACHE_MAX_FILE_SIZE_MB={UPLOAD_CACHE_MAX_FILE_SIZE_MB}MB")
+    if MAX_FILE_SIZE > 0 and end > MAX_FILE_SIZE * 1024 * 1024:
+        raise HTTPException(413, f"文件超过 MAX_FILE_SIZE={MAX_FILE_SIZE}MB")
 
     path = Path(s["cache_path"])
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -370,6 +386,8 @@ async def receive_upload_data(session_id: str, file: UploadFile) -> dict:
                 received += len(chunk)
                 if UPLOAD_CACHE_MAX_FILE_SIZE_MB > 0 and received > UPLOAD_CACHE_MAX_FILE_SIZE_MB * 1024 * 1024:
                     raise HTTPException(413, f"文件超过 UPLOAD_CACHE_MAX_FILE_SIZE_MB={UPLOAD_CACHE_MAX_FILE_SIZE_MB}MB")
+                if MAX_FILE_SIZE > 0 and received > MAX_FILE_SIZE * 1024 * 1024:
+                    raise HTTPException(413, f"文件超过 MAX_FILE_SIZE={MAX_FILE_SIZE}MB")
                 out.write(chunk)
                 if received % (8 * WRITE_CHUNK_SIZE) == 0:
                     await _update(session_id, received_size=received, updated_at=_now())
@@ -382,7 +400,11 @@ async def receive_upload_data(session_id: str, file: UploadFile) -> dict:
             msg = str(e.detail)
         else:
             msg = str(e)
-        await _update(session_id, status="failed", stage="receiving", error=msg, updated_at=_now())
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        await _update(session_id, status="failed", stage="receiving", received_size=0, error=msg, updated_at=_now())
         raise
 
 

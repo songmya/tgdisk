@@ -1,23 +1,23 @@
 """TGDrive Web UI - FastAPI 后端"""
 
 import os
-import hashlib
-import asyncio
+import secrets
+import tempfile
 import aiosqlite
 from pathlib import Path
-from fastapi import FastAPI, Query, HTTPException, UploadFile, File, Request, BackgroundTasks
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi import FastAPI, Query, HTTPException, UploadFile, File, Request, BackgroundTasks, Depends
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.wsgi import WSGIMiddleware
 import uvicorn
 
 import config
 from database import init_db
-from config import DB_PATH, BOT_TOKEN, PROXY, ADMIN_IDS, MAX_FILE_SIZE
+from config import (
+    DB_PATH, ADMIN_IDS, WEBUI_TOKEN, CORS_ALLOW_ORIGINS, RESUME_ALLOWED_DIRS,
+)
 from tg_io import (upload_local_file_to_tg, upload_stream_to_tg,
                    stream_file_by_id, resume_chunks, cleanup_orphans,
-                   SINGLE_UPLOAD_THRESHOLD, CHUNK_SIZE,
                    delete_tg_messages_for_file)
 from upload_cache import (
     UPLOAD_CACHE_ENABLED,
@@ -37,7 +37,52 @@ from upload_cache import (
 )
 
 app = FastAPI(title="TGDrive Web")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ALLOW_ORIGINS or (["*"] if not WEBUI_TOKEN else []),
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+def require_web_auth(request: Request):
+    """Simple bearer/query-token guard for WebUI APIs.
+
+    Empty WEBUI_TOKEN preserves the previous no-auth behavior for local deployments;
+    set WEBUI_TOKEN in production.
+    """
+    if not WEBUI_TOKEN:
+        return True
+    auth = request.headers.get("authorization", "")
+    token = ""
+    if auth.lower().startswith("bearer "):
+        token = auth.split(None, 1)[1].strip()
+    token = token or request.query_params.get("token", "") or request.cookies.get("tgdisk_token", "")
+    if not secrets.compare_digest(token, WEBUI_TOKEN):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return True
+
+
+def _safe_resume_path(source_path: str) -> str:
+    path = Path(source_path).expanduser().resolve()
+    default_dirs = [Path(os.getenv("UPLOAD_CACHE_DIR", "data/cache")).resolve(), Path(tempfile.gettempdir()).resolve()]
+    roots = [Path(p).expanduser().resolve() for p in (RESUME_ALLOWED_DIRS or [])] or default_dirs
+    if not any(path == root or root in path.parents for root in roots):
+        allowed = ", ".join(str(r) for r in roots)
+        raise HTTPException(403, f"source_path 不在允许目录内: {allowed}")
+    if not path.is_file():
+        raise HTTPException(400, f"source_path 不存在: {path}")
+    return str(path)
+
+
+async def _multipart_ready(file_id: int) -> dict:
+    from database import FileDB
+    db = await aiosqlite.connect(DB_PATH)
+    db.row_factory = aiosqlite.Row
+    try:
+        return await FileDB(db).multipart_integrity(file_id)
+    finally:
+        await db.close()
 
 
 @app.on_event("startup")
@@ -78,7 +123,7 @@ except Exception as e:
 
 
 @app.get("/api/webdav")
-async def api_webdav_info():
+async def api_webdav_info(_auth=Depends(require_web_auth)):
     return {
         "enabled": True,
         "path": "/dav",
@@ -87,15 +132,20 @@ async def api_webdav_info():
     }
 
 @app.get("/", response_class=HTMLResponse)
-async def index():
+async def index(request: Request):
     idx = WWW / "index.html"
     if not idx.exists():
-        return HTMLResponse("<h1>UI 文件未找到，请先部署前端</h1>")
-    return HTMLResponse(idx.read_text(encoding="utf-8"))
+        response = HTMLResponse("<h1>UI 文件未找到，请先部署前端</h1>")
+    else:
+        response = HTMLResponse(idx.read_text(encoding="utf-8"))
+    token = request.query_params.get("token", "")
+    if WEBUI_TOKEN and secrets.compare_digest(token, WEBUI_TOKEN):
+        response.set_cookie("tgdisk_token", token, httponly=True, samesite="lax")
+    return response
 
 
 @app.get("/api/stats")
-async def api_stats():
+async def api_stats(_auth=Depends(require_web_auth)):
     rows = await query_db(
         "SELECT COUNT(*) as count, COALESCE(SUM(file_size),0) as total_size FROM files WHERE deleted=0"
     )
@@ -126,6 +176,7 @@ async def api_files(
     search: str = Query(""),
     page: int = Query(1),
     limit: int = Query(50),
+    _auth=Depends(require_web_auth),
 ):
     offset = (page - 1) * limit
     if search:
@@ -177,7 +228,7 @@ async def api_files(
 
 
 @app.get("/api/dirs")
-async def api_dirs(path: str = Query("/")):
+async def api_dirs(path: str = Query("/"), _auth=Depends(require_web_auth)):
     subdirs = await query_db(
         "SELECT * FROM dirs WHERE parent_path=? ORDER BY name", (path,)
     )
@@ -195,7 +246,7 @@ async def api_dirs(path: str = Query("/")):
 
 
 @app.post("/api/upload")
-async def api_upload(background_tasks: BackgroundTasks, file: UploadFile = File(...), path: str = "/"):
+async def api_upload(background_tasks: BackgroundTasks, file: UploadFile = File(...), path: str = "/", _auth=Depends(require_web_auth)):
     """网页端上传：先写入可配置缓存文件，再后台上传 Telegram。
 
     返回 upload session，前端可轮询 /api/uploads/{session_id} 获取
@@ -247,6 +298,7 @@ async def api_upload_init(
     file_size: int = Query(...),
     mime_type: str = Query("application/octet-stream"),
     path: str = Query("/"),
+    _auth=Depends(require_web_auth),
 ):
     """初始化浏览器分块上传任务。"""
     session = await create_upload_session(
@@ -258,19 +310,19 @@ async def api_upload_init(
 
 
 @app.post("/api/uploads/{session_id}/chunk")
-async def api_upload_chunk(session_id: str, request: Request, offset: int = Query(...)):
+async def api_upload_chunk(session_id: str, request: Request, offset: int = Query(...), _auth=Depends(require_web_auth)):
     """写入一个浏览器分片。客户端必须按 offset 顺序上传。"""
     data = await request.body()
     return await write_upload_chunk(session_id, offset, data)
 
 
 @app.post("/api/uploads/{session_id}/pause")
-async def api_pause_upload_session(session_id: str):
+async def api_pause_upload_session(session_id: str, _auth=Depends(require_web_auth)):
     return await mark_upload_paused(session_id)
 
 
 @app.post("/api/uploads/{session_id}/commit")
-async def api_commit_upload_session(session_id: str, background_tasks: BackgroundTasks):
+async def api_commit_upload_session(session_id: str, background_tasks: BackgroundTasks, _auth=Depends(require_web_auth)):
     session = await commit_cached_upload(session_id)
     background_tasks.add_task(process_cached_upload, session_id)
     session["accepted"] = True
@@ -278,37 +330,37 @@ async def api_commit_upload_session(session_id: str, background_tasks: Backgroun
 
 
 @app.get("/api/upload-cache")
-async def api_upload_cache_info():
+async def api_upload_cache_info(_auth=Depends(require_web_auth)):
     return await cache_info()
 
 
 @app.post("/api/upload-cache/cleanup")
-async def api_upload_cache_cleanup():
+async def api_upload_cache_cleanup(_auth=Depends(require_web_auth)):
     return await cleanup_upload_cache()
 
 
 @app.get("/api/uploads")
-async def api_uploads(limit: int = Query(50)):
+async def api_uploads(limit: int = Query(50), _auth=Depends(require_web_auth)):
     return {"uploads": await list_upload_sessions(limit=limit)}
 
 
 @app.get("/api/uploads/{session_id}")
-async def api_upload_session(session_id: str):
+async def api_upload_session(session_id: str, _auth=Depends(require_web_auth)):
     return await get_upload_session(session_id)
 
 
 @app.post("/api/uploads/{session_id}/cancel")
-async def api_cancel_upload_session(session_id: str):
+async def api_cancel_upload_session(session_id: str, _auth=Depends(require_web_auth)):
     return await cancel_upload_session(session_id)
 
 
 @app.delete("/api/uploads/{session_id}")
-async def api_delete_upload_session(session_id: str):
+async def api_delete_upload_session(session_id: str, _auth=Depends(require_web_auth)):
     return await delete_upload_session(session_id)
 
 
 @app.post("/api/mkdir")
-async def api_mkdir(name: str = Query(...), parent: str = Query("/")):
+async def api_mkdir(name: str = Query(...), parent: str = Query("/"), _auth=Depends(require_web_auth)):
     """网页端创建目录"""
     from database import DirDB
     db = await aiosqlite.connect(DB_PATH)
@@ -326,7 +378,7 @@ async def api_mkdir(name: str = Query(...), parent: str = Query("/")):
         await db.close()
 
 @app.post("/api/delete/{file_id}")
-async def api_delete(file_id: int):
+async def api_delete(file_id: int, _auth=Depends(require_web_auth)):
     """网页端删除索引"""
     from database import FileDB
     db = await aiosqlite.connect(DB_PATH)
@@ -340,7 +392,7 @@ async def api_delete(file_id: int):
     finally:
         await db.close()
 @app.get("/api/trash")
-async def api_trash(page: int = Query(1), limit: int = Query(50)):
+async def api_trash(page: int = Query(1), limit: int = Query(50), _auth=Depends(require_web_auth)):
     """回收站列表。"""
     from database import FileDB
     offset = (page - 1) * limit
@@ -371,7 +423,7 @@ async def api_trash(page: int = Query(1), limit: int = Query(50)):
 
 
 @app.post("/api/trash/{file_id}/restore")
-async def api_restore_file(file_id: int):
+async def api_restore_file(file_id: int, _auth=Depends(require_web_auth)):
     """从回收站恢复文件。"""
     from database import FileDB
     db = await aiosqlite.connect(DB_PATH)
@@ -387,7 +439,7 @@ async def api_restore_file(file_id: int):
 
 
 @app.delete("/api/trash/{file_id}")
-async def api_purge_file(file_id: int, delete_tg: bool = Query(True)):
+async def api_purge_file(file_id: int, delete_tg: bool = Query(True), _auth=Depends(require_web_auth)):
     """从回收站彻底删除索引；默认先尽力删除 Telegram 消息。"""
     from database import FileDB
     tg_delete = {"skipped": True}
@@ -406,7 +458,7 @@ async def api_purge_file(file_id: int, delete_tg: bool = Query(True)):
 
 
 @app.get("/api/proxy-download/{file_id}")
-async def proxy_download(file_id: int, request: Request):
+async def proxy_download(file_id: int, request: Request, _auth=Depends(require_web_auth)):
     """后端代理下载，支持 Range 请求。单文件 / multipart 自动识别。"""
     from starlette.responses import StreamingResponse, Response
 
@@ -419,6 +471,15 @@ async def proxy_download(file_id: int, request: Request):
         raise HTTPException(404, "文件不存在")
 
     f = row[0]
+    if f.get("is_multipart"):
+        integrity = await _multipart_ready(file_id)
+        if not integrity.get("complete"):
+            raise HTTPException(503, {
+                "message": "multipart 文件分片不完整，需先续传",
+                "missing": integrity.get("missing", []),
+                "ok_count": integrity.get("ok_count"),
+                "chunk_count": integrity.get("chunk_count"),
+            })
     total = f["file_size"]
     range_header = request.headers.get("range") or request.headers.get("Range")
 
@@ -457,7 +518,7 @@ async def proxy_download(file_id: int, request: Request):
 
 
 @app.get("/api/upload-status/{file_id}")
-async def api_upload_status(file_id: int):
+async def api_upload_status(file_id: int, _auth=Depends(require_web_auth)):
     """查看一个 multipart 上传的进度与缺失分片。"""
     from database import FileDB
     db = await aiosqlite.connect(DB_PATH)
@@ -485,13 +546,12 @@ async def api_upload_status(file_id: int):
 
 
 @app.post("/api/resume-upload/{file_id}")
-async def api_resume_upload(file_id: int, source_path: str = Query(...)):
+async def api_resume_upload(file_id: int, source_path: str = Query(...), _auth=Depends(require_web_auth)):
     """从本地 source_path 文件重传 file_id 的缺失分片。
     注意：source_path 必须是服务器本地可读路径（临时上传后未订零的供重传用）。
     仅限本地/运维使用。"""
     from database import FileDB
-    if not os.path.isfile(source_path):
-        raise HTTPException(400, f"source_path 不存在: {source_path}")
+    source_path = _safe_resume_path(source_path)
     db = await aiosqlite.connect(DB_PATH)
     db.row_factory = aiosqlite.Row
     try:
@@ -508,7 +568,7 @@ async def api_resume_upload(file_id: int, source_path: str = Query(...)):
 
 
 @app.post("/api/cleanup-orphans")
-async def api_cleanup_orphans(hours: int = Query(24), apply: bool = Query(False)):
+async def api_cleanup_orphans(hours: int = Query(24), apply: bool = Query(False), _auth=Depends(require_web_auth)):
     """查找 / 清理 hours 小时前未集齐分片的 multipart 文件。默认 dry_run。"""
     return await cleanup_orphans(hours=hours, dry_run=not apply)
 
