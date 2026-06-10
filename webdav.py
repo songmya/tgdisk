@@ -16,6 +16,7 @@ import tempfile
 from io import BytesIO
 from typing import Optional
 from wsgidav.dav_provider import DAVProvider, DAVCollection, DAVNonCollection
+from wsgidav.dav_error import DAVError, HTTP_FORBIDDEN, HTTP_CONFLICT
 from wsgidav.wsgidav_app import WsgiDAVApp
 from cheroot import wsgi
 
@@ -23,6 +24,7 @@ import config
 from config import DB_PATH, BOT_TOKEN, PROXY, ADMIN_IDS
 from database import FileDB, DirDB
 from tg_io import upload_local_file_to_tg, upload_stream_to_tg, stream_file_by_id
+from utils import normalize_path
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("webdav")
@@ -253,8 +255,37 @@ class TelegramFolder(DAVCollection):
 
     def delete(self):
         # 目录本身没有 deleted 标记；暂不支持 WebDAV 删除目录，避免误删整棵树。
-        from wsgidav.dav_error import DAVError, HTTP_FORBIDDEN
         raise DAVError(HTTP_FORBIDDEN, "目录删除暂不支持；文件删除会进入回收站")
+
+    def create_collection(self, name):
+        """WebDAV MKCOL：在当前目录下创建子目录。"""
+        assert self.is_collection
+        name = (name or "").strip().strip("/")
+        if not name or "/" in name or name in (".", ".."):
+            raise DAVError(HTTP_CONFLICT, "非法目录名")
+
+        async def do_create():
+            db = await aiosqlite.connect(DB_PATH)
+            db.row_factory = aiosqlite.Row
+            try:
+                dir_db = DirDB(db)
+                parent_path = normalize_path(self.db_path)
+                if not await dir_db.dir_exists(parent_path):
+                    raise DAVError(HTTP_CONFLICT, "父目录不存在")
+                created_path = await dir_db.create_dir(name, parent_path)
+                if not created_path:
+                    raise DAVError(HTTP_FORBIDDEN, "目录已存在")
+                return created_path
+            finally:
+                await db.close()
+
+        created_path = run_async(do_create())
+        logger.info("WebDAV mkdir: %s", created_path)
+        return TelegramFolder(
+            self.path + name if self.path.endswith("/") else self.path + "/" + name,
+            self.environ,
+            created_path,
+        )
         
     def begin_write(self, content_type=None):
         """WebDAV上传：先写入本地临时文件，关闭后由系统触发后台TG上传"""
@@ -328,6 +359,7 @@ class TGDriveProvider(DAVProvider):
 
     def get_resource_inst(self, path, environ):
         self._count_get_inst += 1
+        request_method = environ.get("REQUEST_METHOD", "")
         
         if path == "/":
             return TelegramFolder("/", environ, "/")
@@ -344,9 +376,11 @@ class TGDriveProvider(DAVProvider):
             if i == len(parts) - 1:
                 next_curr = curr.get_member(part)
                 if not next_curr:
-                    if environ["REQUEST_METHOD"] == "PUT":
+                    if request_method == "PUT":
                         child_path = curr.path + part if curr.path.endswith("/") else curr.path + "/" + part
                         return TempUploadFile(child_path, environ, curr.db_path, part)
+                    # MKCOL 必须让 WsgiDAV 看到目标 URL 尚未映射，随后由父目录
+                    # create_collection() 创建；这里不能返回临时文件对象。
                     return None
                 curr = next_curr
             else:
