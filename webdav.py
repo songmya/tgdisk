@@ -44,24 +44,42 @@ def run_async(coro):
 
 
 class _TGStreamReader(io.RawIOBase):
-    """把 tg_io.stream_file_by_id（async generator）包装成同步类文件。
+    """把 tg_io.stream_file_by_id（async generator）包装成同步 seekable 文件。
 
-    支持 range_start / range_end。
+    WsgiDAV 在处理普通 GET / Range GET 时会调用 seek()/tell()。这里的 seek
+    会重新打开底层 Telegram 流，从新的绝对偏移开始读取，避免本地缓存整文件。
     """
 
-    def __init__(self, file_id_int: int, range_start: int = 0,
-                 range_end: Optional[int] = None):
+    def __init__(self, file_id_int: int, file_size: int):
         super().__init__()
         self._file_id = file_id_int
+        self._file_size = int(file_size or 0)
         self._loop = asyncio.new_event_loop()
         self._buf = b""
-        self._gen = self._loop.run_until_complete(
-            self._open_gen(range_start, range_end))
+        self._pos = 0
+        self._gen = None
         self._finished = False
+        self._open_at(0)
 
-    async def _open_gen(self, lo, hi):
-        return stream_file_by_id(self._file_id, range_start=lo,
-                                 range_end=hi).__aiter__()
+    async def _open_gen(self, lo):
+        return stream_file_by_id(self._file_id, range_start=lo).__aiter__()
+
+    def _close_gen(self):
+        if self._gen is None:
+            return
+        try:
+            self._loop.run_until_complete(self._gen.aclose())
+        except Exception:
+            pass
+        self._gen = None
+
+    def _open_at(self, pos: int):
+        self._close_gen()
+        self._buf = b""
+        self._pos = max(0, min(int(pos), self._file_size))
+        self._finished = self._pos >= self._file_size
+        if not self._finished:
+            self._gen = self._loop.run_until_complete(self._open_gen(self._pos))
 
     def _fill(self, want: int) -> bool:
         while len(self._buf) < want and not self._finished:
@@ -77,20 +95,46 @@ class _TGStreamReader(io.RawIOBase):
     def readable(self):
         return True
 
+    def seekable(self):
+        return True
+
+    def tell(self):
+        return self._pos
+
+    def seek(self, offset, whence=os.SEEK_SET):
+        if whence == os.SEEK_SET:
+            new_pos = offset
+        elif whence == os.SEEK_CUR:
+            new_pos = self._pos + offset
+        elif whence == os.SEEK_END:
+            new_pos = self._file_size + offset
+        else:
+            raise ValueError(f"unsupported whence: {whence}")
+        self._open_at(new_pos)
+        return self._pos
+
     def read(self, n=-1):
+        if self.closed:
+            return b""
         if n is None or n < 0:
-            # 全读
+            chunks = []
+            if self._buf:
+                chunks.append(self._buf)
+                self._pos += len(self._buf)
+                self._buf = b""
             while not self._finished:
                 try:
                     piece = self._loop.run_until_complete(self._gen.__anext__())
                     if piece:
-                        self._buf += piece
+                        chunks.append(piece)
+                        self._pos += len(piece)
                 except StopAsyncIteration:
                     self._finished = True
-            out, self._buf = self._buf, b""
-            return out
+            return b"".join(chunks)
+
         self._fill(n)
         out, self._buf = self._buf[:n], self._buf[n:]
+        self._pos += len(out)
         return out
 
     def readinto(self, b):
@@ -99,10 +143,7 @@ class _TGStreamReader(io.RawIOBase):
         return len(data)
 
     def close(self):
-        try:
-            self._loop.run_until_complete(self._gen.aclose())
-        except Exception:
-            pass
+        self._close_gen()
         try:
             self._loop.close()
         except Exception:
@@ -140,28 +181,11 @@ class TelegramFile(DAVNonCollection):
         return True
 
     def get_content(self):
-        """返回同步 file-like，支持 Range。
-        wsgidav 会读取 environ、解析 Range 后 seek + read；为了不在本地存
-        整个文件，我们部分接管 Range：看 environ['HTTP_RANGE'] 直接起始偏移。
-        如果 wsgidav 调用 seek，我们会报错（不支持）；但大多数场景下它会直接迭代。
-        """
-        env = self.environ or {}
-        rng = env.get("HTTP_RANGE") or env.get("http_range") or ""
-        lo, hi = 0, None
-        if rng.startswith("bytes="):
-            try:
-                spec = rng[6:].split(",")[0].strip()
-                a, _, b = spec.partition("-")
-                if a:
-                    lo = int(a)
-                if b:
-                    hi = int(b)
-            except ValueError:
-                pass
-        logger.info("WebDAV download: %s (id=%s, multipart=%s, range=%s-%s)",
+        """返回同步 seekable file-like，WsgiDAV 负责 Range seek/read。"""
+        logger.info("WebDAV download: %s (id=%s, multipart=%s)",
                     self.file_info["file_name"], self.file_info["id"],
-                    bool(self.file_info.get("is_multipart")), lo, hi)
-        return _TGStreamReader(self.file_info["id"], range_start=lo, range_end=hi)
+                    bool(self.file_info.get("is_multipart")))
+        return _TGStreamReader(self.file_info["id"], self.file_info["file_size"])
 
     def begin_write(self, content_type=None):
         """WebDAV PUT 到已有文件时，直接覆盖同名旧文件。"""
