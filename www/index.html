@@ -222,7 +222,7 @@ function renderTable(dirs, files) {
   let rows = '';
   dirs.forEach(d => {
     rows += `<tr>
-      <td class="name" onclick="navigate('${d.path}')">📁 ${d.name}/</td>
+      <td class="name" onclick="navigate('${d.path}')">📁 ${esc(d.name)}</td>
       <td class="size">-</td><td>目录</td><td>${d.created_at||''}</td>
       <td class="actions"></td>
     </tr>`;
