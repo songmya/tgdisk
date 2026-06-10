@@ -306,6 +306,59 @@ async def _send_with_retry(
     raise RuntimeError(f"sendDocument 失败: {last_err}")
 
 
+async def _send_file_with_retry(
+    session: aiohttp.ClientSession,
+    chat_id: int,
+    local_path: str,
+    filename: str,
+    mime_type: str,
+    caption: str,
+    offset: int = 0,
+    size: Optional[int] = None,
+) -> dict:
+    """带重试的文件对象 sendDocument。每次重试都会重新打开文件范围。"""
+    last_err = None
+    for attempt in range(UPLOAD_RETRY):
+        try:
+            res = await _tg_send_document_file(
+                session, chat_id, local_path, filename, mime_type, caption,
+                offset=offset, size=size,
+            )
+            if res.get("ok"):
+                return res
+            last_err = res.get("description", "unknown")
+        except Exception as e:
+            last_err = str(e)
+        if attempt < UPLOAD_RETRY - 1:
+            await asyncio.sleep(UPLOAD_RETRY_BACKOFF * (attempt + 1))
+    raise RuntimeError(f"sendDocument(file) 失败: {last_err}")
+
+
+def _hash_file_range(local_path: str, offset: int, size: int) -> str:
+    """流式计算文件指定范围 sha256，不把分片读进内存。"""
+    h = hashlib.sha256()
+    with open(local_path, "rb") as f:
+        f.seek(offset)
+        remaining = size
+        while remaining > 0:
+            data = f.read(min(1024 * 1024, remaining))
+            if not data:
+                break
+            h.update(data)
+            remaining -= len(data)
+    if remaining != 0:
+        raise IOError(f"读取文件范围不足: offset={offset}, size={size}")
+    return h.hexdigest()
+
+
+def _hash_file(local_path: str) -> str:
+    h = hashlib.sha256()
+    with open(local_path, "rb") as f:
+        for data in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(data)
+    return h.hexdigest()
+
+
 # ---------- 类型推断 ----------
 
 def guess_file_type(mime_type: str) -> str:
@@ -636,9 +689,7 @@ async def _upload_local_path_to_tg(
     file_type = guess_file_type(mime_type)
     async with aiohttp.ClientSession() as s:
         cap = f"{dest_path} (local stream)" if dest_path != "/" else "来自 TGDrive 的上传"
-        res = await _tg_send_document_file(s, uploader_id, local_path, file_name, mime_type, cap)
-    if not res.get("ok"):
-        raise RuntimeError(f"sendDocument(local stream) 失败: {res.get('description', 'unknown')}")
+        res = await _send_file_with_retry(s, uploader_id, local_path, file_name, mime_type, cap)
 
     msg = res["result"]
     doc = msg.get("document") or {}
@@ -702,27 +753,13 @@ async def _upload_local_multipart_to_tg(
                 offset = idx * LOCAL_PART_SIZE
                 part_size = min(LOCAL_PART_SIZE, size - offset)
                 part_name = f"{file_name}.part{idx+1:04d}"
-                chunk_sha = hashlib.sha256()
-                # 只为校验计算流式 hash，不把分片读进内存。
-                with open(local_path, "rb") as f:
-                    f.seek(offset)
-                    remaining = part_size
-                    while remaining > 0:
-                        data = f.read(min(1024 * 1024, remaining))
-                        if not data:
-                            break
-                        chunk_sha.update(data)
-                        sha.update(data)
-                        remaining -= len(data)
-                chunk_hex = chunk_sha.hexdigest()
+                chunk_hex = _hash_file_range(local_path, offset, part_size)
                 cap = (f"【分片 {idx+1}/{chunk_count}】{file_name}\n"
                        f"file_int_id={file_int_id} sha={chunk_hex[:12]}")
-                res = await _tg_send_document_file(
+                res = await _send_file_with_retry(
                     s, uploader_id, local_path, part_name, "application/octet-stream",
                     cap, offset=offset, size=part_size,
                 )
-                if not res.get("ok"):
-                    raise RuntimeError(f"sendDocument(local part {idx+1}) 失败: {res.get('description', 'unknown')}")
                 msg = res["result"]
                 doc = msg.get("document", {})
                 db2 = await aiosqlite.connect(DB_PATH)
@@ -751,27 +788,24 @@ async def _upload_local_multipart_to_tg(
                 if progress_cb:
                     progress_cb(total_done, size)
 
+        total_sha = _hash_file(local_path)
         db3 = await aiosqlite.connect(DB_PATH)
         try:
             await db3.execute(
                 "UPDATE files SET file_size=?, chunk_count=?, total_sha256=? WHERE id=?",
-                (size, chunk_count, sha.hexdigest(), file_int_id),
+                (size, chunk_count, total_sha, file_int_id),
             )
             await db3.commit()
         finally:
             await db3.close()
     except Exception:
-        db4 = await aiosqlite.connect(DB_PATH)
-        try:
-            await db4.execute("UPDATE files SET deleted=1 WHERE id=?", (file_int_id,))
-            await db4.commit()
-        finally:
-            await db4.close()
+        # 保留主记录和已成功分片，便于 /api/resume-upload 断点续传。
+        logger.warning("local multipart upload interrupted; kept partial file_id=%s for resume", file_int_id)
         raise
 
     return {"ok": True, "mode": "local_multipart", "file_id": file_int_id,
             "file_name": file_name, "size": size, "path": dest_path,
-            "chunk_count": chunk_count, "sha256": sha.hexdigest()}
+            "chunk_count": chunk_count, "sha256": total_sha}
 
 
 # ---------- 兼容入口：从本地文件上传（webdav / 旧 webui 调用） ----------
@@ -836,11 +870,90 @@ async def upload_local_file_to_tg(
 
 async def resume_chunks(file_id_int: int, missing: list[int],
                          source_path: str) -> dict:
-    """根据 missing chunk 索引，从本地源文件读取对应区域并重传。"""
+    """根据 missing chunk 索引，从本地源文件读取对应区域并重传。
+
+    LOCAL_API_MODE 下按 TG_LOCAL_PART_SIZE_MB 的文件范围流式重传，避免把
+    1500MB 分片读进内存；非 local 回退旧逻辑的 CHUNK_SIZE + bytes 重传。
+    """
     if not missing:
         return {"ok": True, "resent": 0}
 
     from database import FileDB
+    source_size = os.path.getsize(source_path)
+    db0 = await aiosqlite.connect(DB_PATH)
+    db0.row_factory = aiosqlite.Row
+    try:
+        cur = await db0.execute("SELECT file_name, mime_type FROM files WHERE id=? AND deleted=0", (file_id_int,))
+        row = await cur.fetchone()
+        if not row:
+            raise RuntimeError(f"文件记录不存在或已删除: {file_id_int}")
+        file_name = row["file_name"]
+        mime_type = row["mime_type"] or "application/octet-stream"
+    finally:
+        await db0.close()
+
+    if LOCAL_API_BASE and LOCAL_API_MODE:
+        resent = 0
+        chunk_count = (source_size + LOCAL_PART_SIZE - 1) // LOCAL_PART_SIZE
+        async with aiohttp.ClientSession() as s:
+            for idx in missing:
+                if idx < 0 or idx >= chunk_count:
+                    continue
+                offset = idx * LOCAL_PART_SIZE
+                part_size = min(LOCAL_PART_SIZE, source_size - offset)
+                if part_size <= 0:
+                    continue
+                chunk_hex = _hash_file_range(source_path, offset, part_size)
+                part_name = f"{file_name}.part{idx+1:04d}"
+                cap = f"【续传 chunk_index={idx}】file_int_id={file_id_int} sha={chunk_hex[:12]}"
+                res = await _send_file_with_retry(
+                    s, ADMIN_IDS[0], source_path, part_name,
+                    "application/octet-stream", cap, offset=offset, size=part_size,
+                )
+                msg = res["result"]
+                doc = msg.get("document", {})
+                db = await aiosqlite.connect(DB_PATH)
+                db.row_factory = aiosqlite.Row
+                try:
+                    await db.execute(
+                        "DELETE FROM file_chunks WHERE file_id_int=? AND chunk_index=?",
+                        (file_id_int, idx),
+                    )
+                    fdb = FileDB(db)
+                    await fdb.add_chunk(
+                        file_id_int=file_id_int, chunk_index=idx,
+                        tg_file_id=doc.get("file_id", ""),
+                        tg_file_unique_id=doc.get("file_unique_id", ""),
+                        chunk_size=part_size, chunk_sha256=chunk_hex,
+                        message_id=msg.get("message_id", 0),
+                        chat_id=msg.get("chat", {}).get("id", 0),
+                    )
+                    if idx == 0:
+                        await db.execute(
+                            "UPDATE files SET file_id=?, file_unique_id=?, message_id=?, chat_id=? WHERE id=?",
+                            (doc.get("file_id", ""), doc.get("file_unique_id", ""),
+                             msg.get("message_id", 0), msg.get("chat", {}).get("id", 0), file_id_int),
+                        )
+                        await db.commit()
+                finally:
+                    await db.close()
+                resent += 1
+
+        db2 = await aiosqlite.connect(DB_PATH)
+        db2.row_factory = aiosqlite.Row
+        try:
+            fdb2 = FileDB(db2)
+            still_missing = await fdb2.get_missing_chunks(file_id_int)
+            if not still_missing:
+                await db2.execute(
+                    "UPDATE files SET file_size=?, chunk_count=?, total_sha256=? WHERE id=?",
+                    (source_size, chunk_count, _hash_file(source_path), file_id_int),
+                )
+                await db2.commit()
+        finally:
+            await db2.close()
+        return {"ok": True, "resent": resent}
+
     sem = asyncio.Semaphore(UPLOAD_CONCURRENCY)
 
     async def resend_one(idx: int):
