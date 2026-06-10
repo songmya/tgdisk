@@ -18,8 +18,13 @@ PROXY = os.getenv("PROXY") or os.getenv("ALL_PROXY") or os.getenv("all_proxy") o
 # 例：http://127.0.0.1:8081  或  https://tg-api.example.com
 LOCAL_API_BASE = os.getenv("LOCAL_API_BASE", "").rstrip("/")
 # 是否使用本地模式（local mode）。本地模式下 Bot API Server 与 Bot 部署在同机，
-# 文件路径返回为绝对路径而不是下载链接，单文件可达 2GB。
+# getFile 会返回 Bot API Server 本地路径，单文件可达 2GB。
 LOCAL_API_MODE = os.getenv("LOCAL_API_MODE", "false").lower() in ("1", "true", "yes", "on")
+
+# Bot API local mode 下载路径映射。getFile 返回的是 Bot API Server 视角的路径，
+# tgdisk 需要能通过共享 volume 读到同一文件；两个路径默认相同。
+BOT_API_SERVER_DIR = os.getenv("BOT_API_SERVER_DIR", "/var/lib/telegram-bot-api").rstrip("/")
+BOT_API_LOCAL_DIR = os.getenv("BOT_API_LOCAL_DIR", BOT_API_SERVER_DIR).rstrip("/")
 
 # 数据库
 DB_PATH = os.getenv("DB_PATH", "data/tgdrive.sqlite3")

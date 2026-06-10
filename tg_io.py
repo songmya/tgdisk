@@ -14,7 +14,7 @@ from typing import AsyncIterator, Awaitable, Callable, Optional
 import aiohttp
 import aiosqlite
 
-from config import BOT_TOKEN, PROXY, ADMIN_IDS, DB_PATH, MAX_FILE_SIZE, LOCAL_API_BASE, LOCAL_API_MODE
+from config import BOT_TOKEN, PROXY, ADMIN_IDS, DB_PATH, MAX_FILE_SIZE, LOCAL_API_BASE, LOCAL_API_MODE, BOT_API_SERVER_DIR, BOT_API_LOCAL_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -190,7 +190,8 @@ async def delete_tg_messages_for_file(file_id_int: int) -> dict:
     }
 
 
-async def _tg_get_file_url(session: aiohttp.ClientSession, file_id: str) -> Optional[str]:
+async def _tg_get_file_ref(session: aiohttp.ClientSession, file_id: str) -> Optional[dict]:
+    """getFile，兼容官方文件 URL 和 self-hosted local mode 本地路径。"""
     proxy = _tg_proxy()
     async with session.post(
         f"{TG_API_BASE}/bot{BOT_TOKEN}/getFile",
@@ -201,7 +202,42 @@ async def _tg_get_file_url(session: aiohttp.ClientSession, file_id: str) -> Opti
     if not data.get("ok"):
         logger.error("getFile failed: %s", data)
         return None
-    return f"{TG_FILE_BASE}/file/bot{BOT_TOKEN}/{data['result']['file_path']}"
+
+    file_path = data.get("result", {}).get("file_path", "")
+    if not file_path:
+        logger.error("getFile returned empty file_path: %s", data)
+        return None
+    if os.path.isabs(file_path):
+        return {"kind": "path", "path": file_path}
+    return {"kind": "url", "url": f"{TG_FILE_BASE}/file/bot{BOT_TOKEN}/{file_path}"}
+
+
+def _map_bot_api_local_path(path: str) -> str:
+    """把 Bot API Server 返回的本地路径映射到 tgdisk 可读路径。
+
+    local mode 的 getFile 返回 Bot API Server 容器视角路径，通常是
+    /var/lib/telegram-bot-api/...。tgdisk 容器需要把同一个 volume 挂到
+    BOT_API_LOCAL_DIR；如果两个容器内路径一致，默认无需配置。
+    """
+    server_dir = BOT_API_SERVER_DIR.rstrip("/")
+    local_dir = BOT_API_LOCAL_DIR.rstrip("/")
+    if server_dir and (path == server_dir or path.startswith(server_dir + "/")):
+        rel = path[len(server_dir):].lstrip("/")
+        return os.path.join(local_dir, rel) if rel else local_dir
+    return path
+
+
+def _read_file_range_sync(path: str, start: int, end: int, chunk_size: int = 64 * 1024):
+    """同步读取本地文件闭区间 [start, end]，供 async 生成器逐块 yield。"""
+    with open(path, "rb") as f:
+        f.seek(start)
+        remaining = end - start + 1
+        while remaining > 0:
+            data = f.read(min(chunk_size, remaining))
+            if not data:
+                break
+            remaining -= len(data)
+            yield data
 
 
 async def _send_with_retry(
@@ -751,14 +787,31 @@ async def stream_file_by_id(
             inner_lo = max(0, range_start - c_start)
             inner_hi = min(csize - 1, range_end - c_start)
 
-            url = await _tg_get_file_url(s, c["tg_file_id"])
-            if not url:
+            ref = await _tg_get_file_ref(s, c["tg_file_id"])
+            if not ref:
                 return
-            # Telegram 文件下载支持 Range 头
+
+            if ref["kind"] == "path":
+                # self-hosted Bot API local mode: getFile 返回 Bot API 服务器本地路径。
+                # tgdisk 与 botapi 同机/同容器路径可见时，直接按 Range 读取本地文件。
+                original_path = ref["path"]
+                path = _map_bot_api_local_path(original_path)
+                if not os.path.exists(path):
+                    logger.error(
+                        "local getFile path does not exist: %s (mapped from %s). "
+                        "Mount Bot API data dir into tgdisk and set BOT_API_SERVER_DIR/BOT_API_LOCAL_DIR if needed.",
+                        path, original_path,
+                    )
+                    return
+                for piece in _read_file_range_sync(path, inner_lo, inner_hi):
+                    yield piece
+                continue
+
+            # 官方/非 local mode: Telegram 文件下载支持 Range 头。
             headers = {}
             if inner_lo > 0 or inner_hi < csize - 1:
                 headers["Range"] = f"bytes={inner_lo}-{inner_hi}"
-            async with s.get(url, proxy=proxy, headers=headers,
+            async with s.get(ref["url"], proxy=proxy, headers=headers,
                              timeout=aiohttp.ClientTimeout(total=600)) as resp:
                 async for piece in resp.content.iter_chunked(64 * 1024):
                     yield piece

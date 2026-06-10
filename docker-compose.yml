@@ -7,19 +7,40 @@ services:
     container_name: tgdisk
     restart: unless-stopped
     env_file: .env
-
-    # 数据持久化：sqlite 数据库 + 任何 sqlite-wal/shm 文件
-    volumes:
-      - ./data:/app/data
+    depends_on:
+      - botapi
 
     ports:
       # WebUI（FastAPI）+ WebDAV（/dav）共用同一个端口
-      - "8080:8080"
+      - "6354:8080"
 
-    # 默认走桥接 + .env 里的 HTTP 代理。
-    # 如果代理在 host 上(127.0.0.1:7890 这类)、且不想暴露到 LAN，
-    # 取消下面 network_mode: host，并把 ports 注释掉。
-    # network_mode: host
+    environment:
+      # 使用同 compose 内的自建 Bot API。
+      # 如果 .env 里已有同名项，这里会覆盖为容器内服务名，避免容器访问宿主 127.0.0.1。
+      LOCAL_API_BASE: "http://botapi:8081"
+      LOCAL_API_MODE: "true"
+
+      # Bot API local mode 下载路径映射：
+      # getFile 返回 botapi 容器内的 /var/lib/telegram-bot-api/...
+      # tgdisk 也把同一个 volume 挂到同一路径，所以两个值保持一致即可。
+      BOT_API_SERVER_DIR: "/var/lib/telegram-bot-api"
+      BOT_API_LOCAL_DIR: "/var/lib/telegram-bot-api"
+
+      # 启用 LOCAL_API_MODE 后，本地缓存文件走低内存文件流上传，
+      # 不需要把分片阈值调很大。
+      TG_UPLOAD_CHUNK_SIZE_MB: "18"
+      TG_SINGLE_UPLOAD_THRESHOLD_MB: "18"
+      UPLOAD_CONCURRENCY: "2"
+
+      UPLOAD_CACHE_ENABLED: "true"
+      UPLOAD_CACHE_DIR: "data/cache"
+      UPLOAD_CACHE_KEEP_AFTER_DONE: "false"
+
+    volumes:
+      # tgdisk 数据库、WebUI 上传缓存等
+      - ./data:/app/data
+      # 关键：共享 botapi 的 local 文件目录给 tgdisk 读取，用于 local mode 下载
+      - ./data/botapi:/var/lib/telegram-bot-api:ro
 
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/api/stats || exit 1"]
@@ -34,22 +55,35 @@ services:
         max-size: "10m"
         max-file: "3"
 
-# ===== 可选：自建 Bot API Server（去掉 50MB / 20MB 限制，单文件最高 2GB）=====
-# 自建后，在 .env 里设置：
-#   LOCAL_API_BASE=http://botapi:8081
-#   LOCAL_API_MODE=true        # 同机部署时启用，下载走本地路径
-# 然后取消下面 botapi 服务的注释。
-# 注意：自建 Bot API Server **不支持出网代理**，所以要么宿主机能直连 Telegram，
-# 要么用 socat / sing-box 之类的工具帮它把出网流量代理掉。
-#
-#  botapi:
-#    image: aiogram/telegram-bot-api:latest
-#    container_name: tgdisk-botapi
-#    restart: unless-stopped
-#    environment:
-#      TELEGRAM_API_ID: "YOUR_API_ID"        # https://my.telegram.org/apps
-#      TELEGRAM_API_HASH: "YOUR_API_HASH"
-#      TELEGRAM_LOCAL: "1"
-#    volumes:
-#      - ./data/botapi:/var/lib/telegram-bot-api
-#    # 不暴露端口，仅 tgdisk 通过容器网络访问
+  botapi:
+    image: aiogram/telegram-bot-api:latest
+    container_name: tgdisk-botapi
+    restart: unless-stopped
+    env_file: .env
+
+    environment:
+      # 在 .env 中填写：
+      # TELEGRAM_API_ID=123456
+      # TELEGRAM_API_HASH=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+      TELEGRAM_API_ID: "${TELEGRAM_API_ID}"
+      TELEGRAM_API_HASH: "${TELEGRAM_API_HASH}"
+      TELEGRAM_LOCAL: "1"
+
+    command:
+      - --http-port=8081
+      - --dir=/var/lib/telegram-bot-api
+      - --local
+
+    volumes:
+      # 关键：botapi local mode 的文件缓存/目录。tgdisk 以只读方式挂载同一个目录。
+      - ./data/botapi:/var/lib/telegram-bot-api
+
+    ports:
+      # 可选：宿主机访问自建 Bot API。tgdisk 容器内部使用 http://botapi:8081。
+      - "6553:8081"
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
