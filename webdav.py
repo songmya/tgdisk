@@ -16,7 +16,8 @@ import tempfile
 from io import BytesIO
 from typing import Optional
 from wsgidav.dav_provider import DAVProvider, DAVCollection, DAVNonCollection
-from wsgidav.dav_error import DAVError, HTTP_FORBIDDEN, HTTP_CONFLICT, HTTP_NOT_FOUND
+from wsgidav import util
+from wsgidav.dav_error import DAVError, HTTP_FORBIDDEN, HTTP_CONFLICT, HTTP_NOT_FOUND, HTTP_CREATED
 from wsgidav.wsgidav_app import WsgiDAVApp
 from cheroot import wsgi
 
@@ -444,6 +445,31 @@ class TGDriveProvider(DAVProvider):
     def __init__(self):
         super().__init__()
         self._count_get_inst = 0
+
+
+    def custom_request_handler(self, environ, start_response, default_handler):
+        """Handle client quirks before WsgiDAV's default methods.
+
+        Some WebDAV clients create folders by sending an empty `PUT /name/`
+        instead of the standard `MKCOL /name`. Treat that as MKCOL for
+        compatibility, otherwise the request is interpreted as uploading an
+        empty file and fails in Telegram upload.
+        """
+        if (
+            environ.get("REQUEST_METHOD") == "PUT"
+            and environ.get("PATH_INFO", "").endswith("/")
+            and util.get_content_length(environ) == 0
+        ):
+            path = environ["PATH_INFO"]
+            parent = self.get_resource_inst(util.get_uri_parent(path), environ)
+            if not parent or not parent.is_collection:
+                util.fail(HTTP_CONFLICT, "Parent must be an existing collection")
+            name = util.get_uri_name(path)
+            if parent.get_member(name):
+                util.fail(HTTP_CONFLICT, "Collection already exists")
+            parent.create_collection(name)
+            return util.send_status_response(environ, start_response, HTTP_CREATED)
+        return default_handler(environ, start_response)
 
     def get_resource_inst(self, path, environ):
         self._count_get_inst += 1
