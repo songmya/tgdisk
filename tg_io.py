@@ -284,6 +284,77 @@ def _read_file_range_sync(path: str, start: int, end: int, chunk_size: int = 64 
             yield data
 
 
+def _read_file_range_sync_retry(path: str, start: int, end: int, chunk_size: int = 64 * 1024):
+    """读取本地文件范围，失败时从已读位置继续重试。"""
+    pos = start
+    last_err = None
+    for attempt in range(UPLOAD_RETRY):
+        try:
+            with open(path, "rb") as f:
+                f.seek(pos)
+                while pos <= end:
+                    data = f.read(min(chunk_size, end - pos + 1))
+                    if not data:
+                        raise IOError(f"local download ended early at {pos}, expected {end + 1}")
+                    pos += len(data)
+                    yield data
+            return
+        except Exception as e:
+            last_err = e
+            if attempt >= UPLOAD_RETRY - 1:
+                break
+            logger.warning(
+                "local range read failed, retrying: path=%s pos=%s end=%s attempt=%s error=%s",
+                path, pos, end, attempt + 1, e,
+            )
+            import time
+            time.sleep(UPLOAD_RETRY_BACKOFF * (attempt + 1))
+    raise IOError(f"local range read failed after retries: {last_err}")
+
+
+async def _http_range_iter_retry(
+    session: aiohttp.ClientSession,
+    url: str,
+    start: int,
+    end: int,
+    proxy: Optional[str],
+    chunk_size: int = 64 * 1024,
+) -> AsyncIterator[bytes]:
+    """HTTP Range 下载，失败时从已发送偏移继续请求。"""
+    pos = start
+    last_err = None
+    for attempt in range(UPLOAD_RETRY):
+        try:
+            headers = {}
+            if pos > 0 or end >= pos:
+                headers["Range"] = f"bytes={pos}-{end}"
+            async with session.get(
+                url, proxy=proxy, headers=headers,
+                timeout=aiohttp.ClientTimeout(total=600),
+            ) as resp:
+                if resp.status >= 400:
+                    text = await resp.text()
+                    raise RuntimeError(f"HTTP {resp.status}: {text[:200]}")
+                async for piece in resp.content.iter_chunked(chunk_size):
+                    if not piece:
+                        continue
+                    pos += len(piece)
+                    yield piece
+            if pos <= end:
+                raise IOError(f"HTTP download ended early at {pos}, expected {end + 1}")
+            return
+        except Exception as e:
+            last_err = e
+            if attempt >= UPLOAD_RETRY - 1:
+                break
+            logger.warning(
+                "HTTP range download failed, retrying: pos=%s end=%s attempt=%s error=%s",
+                pos, end, attempt + 1, e,
+            )
+            await asyncio.sleep(UPLOAD_RETRY_BACKOFF * (attempt + 1))
+    raise RuntimeError(f"HTTP range download failed after retries: {last_err}")
+
+
 async def _send_with_retry(
     session: aiohttp.ClientSession,
     chat_id: int,
@@ -1070,18 +1141,13 @@ async def stream_file_by_id(
                         path, original_path,
                     )
                     return
-                for piece in _read_file_range_sync(path, inner_lo, inner_hi):
+                for piece in _read_file_range_sync_retry(path, inner_lo, inner_hi):
                     yield piece
                 continue
 
-            # 官方/非 local mode: Telegram 文件下载支持 Range 头。
-            headers = {}
-            if inner_lo > 0 or inner_hi < csize - 1:
-                headers["Range"] = f"bytes={inner_lo}-{inner_hi}"
-            async with s.get(ref["url"], proxy=proxy, headers=headers,
-                             timeout=aiohttp.ClientTimeout(total=600)) as resp:
-                async for piece in resp.content.iter_chunked(64 * 1024):
-                    yield piece
+            # 官方/非 local mode: Telegram 文件下载支持 Range 头；失败时从当前位置继续重试。
+            async for piece in _http_range_iter_retry(s, ref["url"], inner_lo, inner_hi, proxy):
+                yield piece
 
 
 # ---------- 孤儿清理 ----------
