@@ -101,6 +101,19 @@ mkdir -p data
 
 `BOT_TOKEN` 从 [@BotFather](https://t.me/BotFather) 获取；`ADMIN_IDS` 可以给 [@userinfobot](https://t.me/userinfobot) 发消息获取 Telegram 数字 ID。
 
+默认示例使用 DockerHub 镜像 `songmy94/tgdrive:latest`。如果你想从当前源码本地构建，把 compose 里的：
+
+```yaml
+image: songmy94/tgdrive:latest
+```
+
+改成：
+
+```yaml
+build: .
+image: songmy94/tgdrive:latest
+```
+
 ---
 
 ## 方式一：使用自建 Telegram Bot API（推荐）
@@ -156,8 +169,7 @@ WEBDAV_PASSWORD=change_me_to_a_strong_password
 ```yaml
 services:
   tgdisk:
-    build: .
-    image: tgdisk:latest
+    image: songmy94/tgdrive:latest
     container_name: tgdisk
     restart: unless-stopped
     env_file: .env
@@ -246,8 +258,7 @@ WEBDAV_PASSWORD=change_me_to_a_strong_password
 ```yaml
 services:
   tgdisk:
-    build: .
-    image: tgdisk:latest
+    image: songmy94/tgdrive:latest
     container_name: tgdisk
     restart: unless-stopped
     env_file: .env

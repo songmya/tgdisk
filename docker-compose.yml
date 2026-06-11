@@ -1,7 +1,6 @@
 services:
   tgdisk:
-    build: .
-    image: tgdisk:latest
+    image: songmy94/tgdrive:latest
     container_name: tgdisk
     restart: unless-stopped
     env_file: .env
