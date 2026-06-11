@@ -18,6 +18,7 @@
 - [方式一：使用自建 Telegram Bot API（推荐）](#方式一使用自建-telegram-bot-api推荐)
 - [方式二：使用官方 Telegram Bot API](#方式二使用官方-telegram-bot-api)
 - [最简配置说明](#最简配置说明)
+- [完整环境变量参考](#完整环境变量参考)
 - [访问方式](#访问方式)
 - [Telegram Bot 命令](#telegram-bot-命令)
 - [WebUI 使用说明](#webui-使用说明)
@@ -298,6 +299,95 @@ WebDAV: http://服务器IP:6354/dav
 | `WEBDAV_USERNAME` / `WEBDAV_PASSWORD` | 强烈建议 | WebDAV 登录账号密码。 |
 
 其他变量都有默认值，先不用管。等你确实遇到缓存容量、分片大小、续传目录、CORS 等需求时，再回头调整 `.env.example` 里的高级选项。
+
+
+---
+
+## 完整环境变量参考
+
+下面是 `.env` 支持的完整环境变量说明。默认值以当前项目默认配置为准；如果你使用“官方 Bot API”模式，需要按上一节示例把相关 Bot API 变量改掉。
+
+### 必填
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `BOT_TOKEN` | 无 | Telegram Bot Token，从 [@BotFather](https://t.me/BotFather) 获取。 |
+| `ADMIN_IDS` | 无 | 管理员 Telegram 数字 ID，多个用英文逗号分隔。 |
+
+### Telegram 连接 / 代理
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `PROXY` | 空 | 访问官方 `api.telegram.org` 时使用的代理，例如 `http://user:pass@host:port` 或 `socks5://user:pass@host:port`。使用自建 `LOCAL_API_BASE` 时，TGDrive 不会再套这个代理。 |
+| `ALL_PROXY` | 空 | `PROXY` 为空时的备用代理变量。 |
+| `all_proxy` | 空 | `PROXY` 与 `ALL_PROXY` 都为空时的备用代理变量。 |
+
+### 自建 Telegram Bot API / local mode
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `TELEGRAM_API_ID` | 空 | 自建 `telegram-bot-api` 需要，来自 <https://my.telegram.org/apps>。官方 Bot API 模式不需要。 |
+| `TELEGRAM_API_HASH` | 空 | 自建 `telegram-bot-api` 需要，来自 <https://my.telegram.org/apps>。官方 Bot API 模式不需要。 |
+| `TELEGRAM_LOCAL` | `1` | 传给 `telegram-bot-api` 容器，表示启用 local mode。 |
+| `LOCAL_API_BASE` | `http://botapi:8081` | TGDrive 访问 Bot API 的地址。官方 Bot API 模式请设为空。 |
+| `LOCAL_API_MODE` | `true` | TGDrive 是否按 local mode 处理上传/下载。官方 Bot API 模式请设为 `false`。 |
+| `BOT_API_SERVER_DIR` | `/var/lib/telegram-bot-api` | Bot API Server 返回的本地文件路径前缀。 |
+| `BOT_API_LOCAL_DIR` | `/var/lib/telegram-bot-api` | TGDrive 容器内实际可读的本地路径前缀。两个容器挂载同一路径时保持默认即可。 |
+
+### WebUI / HTTP API 安全
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `WEBUI_TOKEN` | 空 | WebUI 和 `/api/*` 访问令牌。为空表示不鉴权；生产环境强烈建议设置。支持 `Authorization: Bearer <token>`、`?token=<token>` 和 `tgdisk_token` Cookie。 |
+| `CORS_ALLOW_ORIGINS` | 空 | 允许跨域来源，多个用英文逗号分隔。留空时：如果未设置 `WEBUI_TOKEN` 则允许 `*`；如果设置了 `WEBUI_TOKEN` 则默认不允许跨域。 |
+| `RESUME_ALLOWED_DIRS` | `/app/data/cache,/tmp,/var/lib/telegram-bot-api` | `/api/resume-upload` 允许读取的服务器本地目录，多个用英文逗号分隔。不要设置得过宽。 |
+
+### WebDAV 安全
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `WEBDAV_USERNAME` | 空 | WebDAV 用户名。为空则匿名访问；生产环境强烈建议设置。 |
+| `WEBDAV_PASSWORD` | 空 | WebDAV 密码。为空则匿名访问；生产环境强烈建议设置。 |
+
+### 数据 / 日志
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `DB_PATH` | `data/tgdrive.sqlite3` | SQLite 数据库路径。 |
+| `PAGE_SIZE` | `20` | Bot 命令分页大小。 |
+| `LOG_LEVEL` | `INFO` | 日志级别。 |
+
+### 上传策略
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `MAX_FILE_SIZE` | `0` | 应用层最大文件大小，单位 MB。`0` 表示不限制。 |
+| `TG_UPLOAD_CHUNK_SIZE_MB` | `1500` | 非 local 旧分片上传大小。官方 Bot API 模式建议改为 `18`。 |
+| `TG_SINGLE_UPLOAD_THRESHOLD_MB` | `1500` | 小于等于该值的文件走单次 `sendDocument`。官方 Bot API 模式建议改为 `18`。 |
+| `TG_LOCAL_SINGLE_UPLOAD_LIMIT_MB` | `1500` | local mode 下，小于等于该值的文件走单文件流式上传。 |
+| `TG_LOCAL_PART_SIZE_MB` | `1500` | local mode 下，超过单文件阈值后按该大小拆分 multipart。 |
+| `UPLOAD_CONCURRENCY` | `1` | 并发上传 Telegram 分片数。官方 Bot API 小分片模式可设为 `4`；local mode 推荐 `1`。 |
+
+### WebUI 上传缓存
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `UPLOAD_CACHE_ENABLED` | `true` | 是否启用 WebUI 上传缓存。启用后浏览器先上传到服务器缓存，再后台上传 Telegram。 |
+| `UPLOAD_CACHE_DIR` | `data/cache` | WebUI 上传缓存目录，也是 WebDAV 临时文件默认目录。 |
+| `UPLOAD_CACHE_MAX_SIZE_MB` | `10240` | 缓存总容量上限，单位 MB。超过后会拒绝新任务并清理过期/已完成任务。 |
+| `UPLOAD_CACHE_MAX_FILE_SIZE_MB` | `0` | 单个缓存文件大小上限，单位 MB。`0` 表示不限制。 |
+| `UPLOAD_CACHE_TTL_HOURS` | `24` | 失败、取消、未完成上传任务的缓存保留时间，单位小时。 |
+| `UPLOAD_CACHE_KEEP_AFTER_DONE` | `false` | 上传 Telegram 成功后是否保留缓存文件。默认成功后删除。 |
+| `BROWSER_CHUNK_SIZE` | `8388608` | 浏览器上传到服务器缓存的分片大小，单位字节；默认 8MiB。 |
+
+### 两种模式的关键差异
+
+| 模式 | 关键变量 |
+|---|---|
+| 自建 Bot API local mode | `LOCAL_API_BASE=http://botapi:8081`、`LOCAL_API_MODE=true`、`TELEGRAM_LOCAL=1`、`TG_LOCAL_SINGLE_UPLOAD_LIMIT_MB=1500`、`TG_LOCAL_PART_SIZE_MB=1500`、`UPLOAD_CONCURRENCY=1` |
+| 官方 Bot API | `LOCAL_API_BASE=`、`LOCAL_API_MODE=false`、`TG_UPLOAD_CHUNK_SIZE_MB=18`、`TG_SINGLE_UPLOAD_THRESHOLD_MB=18`、`UPLOAD_CONCURRENCY=4`，必要时设置 `PROXY` |
+
+---
 
 ## 访问方式
 
