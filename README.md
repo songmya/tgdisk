@@ -116,14 +116,34 @@ mkdir -p data
 
 ### 最简 `.env`
 
+所有可调配置都放在 `.env`，`docker-compose.yml` 只负责服务结构、端口和挂载。
+
 ```env
 # Telegram Bot
 BOT_TOKEN=123456:your_bot_token
 ADMIN_IDS=123456789
 
-# 自建 telegram-bot-api 必填
+# 自建 telegram-bot-api 必填，到 https://my.telegram.org/apps 获取
 TELEGRAM_API_ID=123456
 TELEGRAM_API_HASH=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+TELEGRAM_LOCAL=1
+
+# tgdisk 使用 compose 内的 botapi 服务
+LOCAL_API_BASE=http://botapi:8081
+LOCAL_API_MODE=true
+BOT_API_SERVER_DIR=/var/lib/telegram-bot-api
+BOT_API_LOCAL_DIR=/var/lib/telegram-bot-api
+
+# local mode 推荐值：低内存，少分片
+TG_LOCAL_SINGLE_UPLOAD_LIMIT_MB=1500
+TG_LOCAL_PART_SIZE_MB=1500
+UPLOAD_CONCURRENCY=1
+
+# WebUI 上传缓存
+UPLOAD_CACHE_ENABLED=true
+UPLOAD_CACHE_DIR=data/cache
+UPLOAD_CACHE_KEEP_AFTER_DONE=false
+RESUME_ALLOWED_DIRS=/app/data/cache,/tmp,/var/lib/telegram-bot-api
 
 # WebUI / WebDAV 安全配置，强烈建议填写
 WEBUI_TOKEN=change_me_to_a_long_random_token
@@ -131,13 +151,9 @@ WEBDAV_USERNAME=tgdisk
 WEBDAV_PASSWORD=change_me_to_a_strong_password
 ```
 
-> `TELEGRAM_API_ID` 和 `TELEGRAM_API_HASH` 到 <https://my.telegram.org/apps> 创建应用获取。
-
 ### 最简 `docker-compose.yml`
 
 ```yaml
-version: "3.8"
-
 services:
   tgdisk:
     build: .
@@ -149,24 +165,6 @@ services:
       - botapi
     ports:
       - "6354:8080"
-    environment:
-      # 使用同一个 compose 里的自建 Bot API
-      LOCAL_API_BASE: "http://botapi:8081"
-      LOCAL_API_MODE: "true"
-
-      # botapi 与 tgdisk 挂载同一个目录到同一路径，保持默认即可
-      BOT_API_SERVER_DIR: "/var/lib/telegram-bot-api"
-      BOT_API_LOCAL_DIR: "/var/lib/telegram-bot-api"
-
-      # local mode 推荐值：低内存，少分片
-      TG_LOCAL_SINGLE_UPLOAD_LIMIT_MB: "1500"
-      TG_LOCAL_PART_SIZE_MB: "1500"
-      UPLOAD_CONCURRENCY: "1"
-
-      # WebUI 上传缓存
-      UPLOAD_CACHE_ENABLED: "true"
-      UPLOAD_CACHE_DIR: "data/cache"
-      UPLOAD_CACHE_KEEP_AFTER_DONE: "false"
     volumes:
       - ./data:/app/data
       - ./data/botapi:/var/lib/telegram-bot-api:ro
@@ -176,10 +174,6 @@ services:
     container_name: tgdisk-botapi
     restart: unless-stopped
     env_file: .env
-    environment:
-      TELEGRAM_API_ID: "${TELEGRAM_API_ID}"
-      TELEGRAM_API_HASH: "${TELEGRAM_API_HASH}"
-      TELEGRAM_LOCAL: "1"
     command:
       - --http-port=8081
       - --dir=/var/lib/telegram-bot-api
@@ -216,14 +210,30 @@ WebDAV: http://服务器IP:6354/dav
 
 ### 最简 `.env`
 
+所有可调配置都放在 `.env`。
+
 ```env
 # Telegram Bot
 BOT_TOKEN=123456:your_bot_token
 ADMIN_IDS=123456789
 
+# 明确使用官方 Bot API
+LOCAL_API_BASE=
+LOCAL_API_MODE=false
+
 # 如果服务器不能直连 Telegram，填写代理；能直连则删除或留空
 PROXY=http://user:pass@host:port
 # PROXY=socks5://user:pass@host:port
+
+# 官方 Bot API 建议保持小分片
+TG_UPLOAD_CHUNK_SIZE_MB=18
+TG_SINGLE_UPLOAD_THRESHOLD_MB=18
+UPLOAD_CONCURRENCY=4
+
+# WebUI 上传缓存
+UPLOAD_CACHE_ENABLED=true
+UPLOAD_CACHE_DIR=data/cache
+UPLOAD_CACHE_KEEP_AFTER_DONE=false
 
 # WebUI / WebDAV 安全配置，强烈建议填写
 WEBUI_TOKEN=change_me_to_a_long_random_token
@@ -234,8 +244,6 @@ WEBDAV_PASSWORD=change_me_to_a_strong_password
 ### 最简 `docker-compose.yml`
 
 ```yaml
-version: "3.8"
-
 services:
   tgdisk:
     build: .
@@ -245,20 +253,6 @@ services:
     env_file: .env
     ports:
       - "6354:8080"
-    environment:
-      # 明确使用官方 Bot API
-      LOCAL_API_BASE: ""
-      LOCAL_API_MODE: "false"
-
-      # 官方 Bot API 建议保持小分片
-      TG_UPLOAD_CHUNK_SIZE_MB: "18"
-      TG_SINGLE_UPLOAD_THRESHOLD_MB: "18"
-      UPLOAD_CONCURRENCY: "4"
-
-      # WebUI 上传缓存
-      UPLOAD_CACHE_ENABLED: "true"
-      UPLOAD_CACHE_DIR: "data/cache"
-      UPLOAD_CACHE_KEEP_AFTER_DONE: "false"
     volumes:
       - ./data:/app/data
 ```
